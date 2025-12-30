@@ -17,6 +17,7 @@ pub enum BackendType {
     Aqua,
     Asdf,
     Cargo,
+    Conda,
     Core,
     Dotnet,
     Gem,
@@ -50,6 +51,7 @@ impl BackendType {
             "aqua" => BackendType::Aqua,
             "asdf" => BackendType::Asdf,
             "cargo" => BackendType::Cargo,
+            "conda" => BackendType::Conda,
             "core" => BackendType::Core,
             "dotnet" => BackendType::Dotnet,
             "gem" => BackendType::Gem,
@@ -63,6 +65,17 @@ impl BackendType {
             "ubi" => BackendType::Ubi,
             "vfox" => BackendType::Vfox,
             _ => BackendType::Unknown,
+        }
+    }
+
+    /// Returns true if this backend requires experimental mode to be enabled
+    pub fn is_experimental(&self) -> bool {
+        use super::{conda, dotnet, spm};
+        match self {
+            BackendType::Conda => conda::EXPERIMENTAL,
+            BackendType::Spm => spm::EXPERIMENTAL,
+            BackendType::Dotnet => dotnet::EXPERIMENTAL,
+            _ => false,
         }
     }
 }

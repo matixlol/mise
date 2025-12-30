@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::{
     fmt::{Display, Formatter},
@@ -8,6 +9,7 @@ use eyre::{Result, bail};
 use versions::{Chunk, Version};
 use xx::file;
 
+use crate::backend::platform_target::PlatformTarget;
 use crate::cli::args::BackendArg;
 use crate::lockfile::LockfileTool;
 use crate::runtime_symlinks::is_runtime_symlink;
@@ -258,11 +260,29 @@ impl ToolRequest {
     }
 
     pub fn lockfile_resolve(&self, config: &Config) -> Result<Option<LockfileTool>> {
+        // Get the resolved lockfile options from the backend
+        let request_options = if let Ok(backend) = self.backend() {
+            let target = PlatformTarget::from_current();
+            backend.resolve_lockfile_options(self, &target)
+        } else {
+            BTreeMap::new()
+        };
+
         match self.source() {
-            ToolSource::MiseToml(path) => {
-                lockfile::get_locked_version(config, Some(path), &self.ba().short, &self.version())
-            }
-            _ => lockfile::get_locked_version(config, None, &self.ba().short, &self.version()),
+            ToolSource::MiseToml(path) => lockfile::get_locked_version(
+                config,
+                Some(path),
+                &self.ba().short,
+                &self.version(),
+                &request_options,
+            ),
+            _ => lockfile::get_locked_version(
+                config,
+                None,
+                &self.ba().short,
+                &self.version(),
+                &request_options,
+            ),
         }
     }
 
@@ -291,10 +311,10 @@ impl ToolRequest {
     }
 
     pub fn is_os_supported(&self) -> bool {
-        if let Some(os) = self.os() {
-            if !os.contains(&crate::cli::version::OS) {
-                return false;
-            }
+        if let Some(os) = self.os()
+            && !os.contains(&crate::cli::version::OS)
+        {
+            return false;
         }
         self.ba().is_os_supported()
     }

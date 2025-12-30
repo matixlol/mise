@@ -8,7 +8,7 @@ on:
       chroots:
         description: "COPR chroots to target (space-separated)"
         required: false
-        default: "fedora-rawhide-aarch64 fedora-rawhide-x86_64 fedora-42-aarch64 fedora-42-x86_64 fedora-41-aarch64 fedora-41-x86_64 epel-10-aarch64 epel-10-x86_64 epel-9-aarch64 epel-9-x86_64"
+        default: "fedora-rawhide-aarch64 fedora-rawhide-x86_64 fedora-43-aarch64 fedora-43-x86_64 fedora-42-aarch64 fedora-42-x86_64 fedora-41-aarch64 fedora-41-x86_64 epel-10-aarch64 epel-10-x86_64 epel-9-aarch64 epel-9-x86_64"
         type: string
       use_serious_profile:
         description: 'Use the "serious" profile for optimized builds (LTO enabled)'
@@ -24,11 +24,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     container:
-      image: ghcr.io/jdx/mise:copr@sha256:0f98c7756674b8f48206000cfdad8b8f210406f47d5d1aec8d8d1a638877444b
+      image: ghcr.io/jdx/mise:copr@sha256:af06edf403b4c76b79514e634c195c1c97c28fd9b3a022c7e0a9aa898b3e569a
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
@@ -37,7 +37,7 @@ jobs:
           VERSION=$(./scripts/get-version.sh | sed 's/^v//')
 
           if [ "${{ github.event_name }}" = "release" ]; then
-            CHROOTS="fedora-rawhide-aarch64 fedora-rawhide-x86_64 fedora-42-aarch64 fedora-42-x86_64 fedora-41-aarch64 fedora-41-x86_64 epel-10-aarch64 epel-10-x86_64 epel-9-aarch64 epel-9-x86_64"
+            CHROOTS="fedora-rawhide-aarch64 fedora-rawhide-x86_64 fedora-43-aarch64 fedora-43-x86_64 fedora-42-aarch64 fedora-42-x86_64 fedora-41-aarch64 fedora-41-x86_64 epel-10-aarch64 epel-10-x86_64 epel-9-aarch64 epel-9-x86_64"
           else
             CHROOTS="${{ inputs.chroots }}"
           fi

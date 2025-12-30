@@ -1,3 +1,5 @@
+use crate::backend::VersionInfo;
+use crate::backend::static_helpers::fetch_checksum_from_shasums;
 use crate::backend::{Backend, VersionCacheManager, platform_target::PlatformTarget};
 use crate::build_time::built_info;
 use crate::cache::CacheManagerBuilder;
@@ -7,7 +9,8 @@ use crate::config::{Config, Settings};
 use crate::file::{TarFormat, TarOptions};
 use crate::http::{HTTP, HTTP_FETCH};
 use crate::install_context::InstallContext;
-use crate::toolset::ToolVersion;
+use crate::lockfile::PlatformInfo;
+use crate::toolset::{ToolRequest, ToolVersion};
 use crate::ui::progress_report::SingleReport;
 use crate::{env, file, gpg, hash, http, plugins};
 use async_trait::async_trait;
@@ -401,7 +404,22 @@ impl Backend for NodePlugin {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
+    async fn security_info(&self) -> Vec<crate::backend::SecurityFeature> {
+        use crate::backend::SecurityFeature;
+
+        let mut features = vec![SecurityFeature::Checksum {
+            algorithm: Some("sha256".to_string()),
+        }];
+
+        // GPG verification is available for Node.js v20+ when gpg is installed
+        if Settings::get().node.gpg_verify != Some(false) {
+            features.push(SecurityFeature::Gpg);
+        }
+
+        features
+    }
+
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
         let settings = Settings::get();
         let base = Settings::get().node.mirror_url();
         let versions = HTTP_FETCH
@@ -418,10 +436,15 @@ impl Backend for NodePlugin {
                 }
             })
             .map(|v| {
-                if regex!(r"^v\d+\.").is_match(&v.version) {
+                let version = if regex!(r"^v\d+\.").is_match(&v.version) {
                     v.version.strip_prefix('v').unwrap().to_string()
                 } else {
                     v.version
+                };
+                VersionInfo {
+                    version,
+                    created_at: v.date,
+                    ..Default::default()
                 }
             })
             .rev()
@@ -441,6 +464,7 @@ impl Backend for NodePlugin {
             ("lts/hydrogen", "18"),
             ("lts/iron", "20"),
             ("lts/jod", "22"),
+            ("lts/krypton", "24"),
             ("lts-argon", "4"),
             ("lts-boron", "6"),
             ("lts-carbon", "8"),
@@ -451,7 +475,8 @@ impl Backend for NodePlugin {
             ("lts-hydrogen", "18"),
             ("lts-iron", "20"),
             ("lts-jod", "22"),
-            ("lts", "22"),
+            ("lts-krypton", "24"),
+            ("lts", "24"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -568,6 +593,71 @@ impl Backend for NodePlugin {
 
         Ok(Some(url.to_string()))
     }
+
+    fn resolve_lockfile_options(
+        &self,
+        _request: &ToolRequest,
+        target: &PlatformTarget,
+    ) -> BTreeMap<String, String> {
+        let mut opts = BTreeMap::new();
+        let settings = Settings::get();
+        let is_current_platform = target.is_current();
+
+        // Only include compile option if true (non-default)
+        let compile = if is_current_platform {
+            settings.node.compile.unwrap_or(false)
+        } else {
+            false
+        };
+        if compile {
+            opts.insert("compile".to_string(), "true".to_string());
+        }
+
+        // Flavor affects which binary variant is downloaded (only if set)
+        if is_current_platform && let Some(flavor) = settings.node.flavor.clone() {
+            opts.insert("flavor".to_string(), flavor);
+        }
+
+        opts
+    }
+
+    async fn resolve_lock_info(
+        &self,
+        tv: &ToolVersion,
+        target: &PlatformTarget,
+    ) -> Result<PlatformInfo> {
+        let version = &tv.version;
+        let settings = Settings::get();
+
+        // Build platform-specific filename
+        let slug = self.build_platform_slug(version, target);
+        let filename = if target.os_name() == "windows" {
+            format!("{slug}.zip")
+        } else {
+            format!("{slug}.tar.gz")
+        };
+
+        // Build download URL
+        let url = settings
+            .node
+            .mirror_url()
+            .join(&format!("v{version}/{filename}"))
+            .map_err(|e| eyre::eyre!("Failed to construct Node.js download URL: {e}"))?;
+
+        // Fetch SHASUMS256.txt to get checksum without downloading the tarball
+        let shasums_url = settings
+            .node
+            .mirror_url()
+            .join(&format!("v{version}/SHASUMS256.txt"))?;
+        let checksum = fetch_checksum_from_shasums(shasums_url.as_str(), &filename).await;
+
+        Ok(PlatformInfo {
+            url: Some(url.to_string()),
+            checksum,
+            size: None,
+            url_api: None,
+        })
+    }
 }
 
 impl NodePlugin {
@@ -603,11 +693,15 @@ impl NodePlugin {
         let os = Self::map_os(target.os_name());
         let arch = Self::map_arch(target.arch_name());
 
-        if let Some(flavor) = &settings.node.flavor {
-            format!("node-v{version}-{os}-{arch}-{flavor}")
-        } else {
-            format!("node-v{version}-{os}-{arch}")
+        // Flavor (like "glibc") only applies to the current Linux platform
+        // Don't apply it to non-current platforms during cross-platform locking
+        if target.is_current()
+            && target.os_name() == "linux"
+            && let Some(flavor) = &settings.node.flavor
+        {
+            return format!("node-v{version}-{os}-{arch}-{flavor}");
         }
+        format!("node-v{version}-{os}-{arch}")
     }
 }
 
@@ -719,5 +813,6 @@ fn slug(v: &str) -> String {
 #[derive(Debug, Deserialize)]
 struct NodeVersion {
     version: String,
+    date: Option<String>,
     files: Vec<String>,
 }

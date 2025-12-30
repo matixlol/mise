@@ -1,6 +1,6 @@
 use crate::semver::{chunkify_version, split_version_prefix};
 use crate::toolset;
-use crate::toolset::{ToolRequest, ToolSource, ToolVersion};
+use crate::toolset::{ResolveOptions, ToolRequest, ToolSource, ToolVersion};
 use crate::{Result, config::Config};
 use serde_derive::Serialize;
 use std::{
@@ -53,15 +53,24 @@ impl OutdatedInfo {
         config: &Arc<Config>,
         tv: ToolVersion,
         bump: bool,
+        opts: &ResolveOptions,
     ) -> eyre::Result<Option<Self>> {
         let t = tv.backend()?;
         // prefix is something like "temurin-" or "corretto-"
         let (prefix, _) = split_version_prefix(&tv.request.version());
         let latest_result = if bump {
-            t.latest_version(config, Some(prefix.clone()).filter(|s| !s.is_empty()))
-                .await
+            // Note: Backend's latest_version_with_opts takes individual parameters,
+            // not a ResolveOptions struct like ToolVersion's method
+            t.latest_version_with_opts(
+                config,
+                Some(prefix.clone()).filter(|s| !s.is_empty()),
+                opts.before_date,
+            )
+            .await
         } else {
-            tv.latest_version(config).await.map(Option::from)
+            tv.latest_version_with_opts(config, opts)
+                .await
+                .map(Option::from)
         };
         let latest = match latest_result {
             Ok(Some(latest)) => latest,
@@ -87,41 +96,41 @@ impl OutdatedInfo {
             let old = oi.tool_version.request.version();
             let old = old.strip_prefix(&prefix).unwrap_or_default();
             let new = oi.latest.strip_prefix(&prefix).unwrap_or_default();
-            if let Some(bumped_version) = check_semver_bump(old, new) {
-                if bumped_version != oi.tool_version.request.version() {
-                    oi.bump = match oi.tool_request.clone() {
-                        ToolRequest::Version {
-                            version: _version,
+            if let Some(bumped_version) = check_semver_bump(old, new)
+                && bumped_version != oi.tool_version.request.version()
+            {
+                oi.bump = match oi.tool_request.clone() {
+                    ToolRequest::Version {
+                        version: _version,
+                        backend,
+                        options,
+                        source,
+                    } => {
+                        oi.tool_request = ToolRequest::Version {
                             backend,
                             options,
                             source,
-                        } => {
-                            oi.tool_request = ToolRequest::Version {
-                                backend,
-                                options,
-                                source,
-                                version: format!("{prefix}{bumped_version}"),
-                            };
-                            Some(oi.tool_request.version())
-                        }
-                        ToolRequest::Prefix {
-                            prefix: _prefix,
+                            version: format!("{prefix}{bumped_version}"),
+                        };
+                        Some(oi.tool_request.version())
+                    }
+                    ToolRequest::Prefix {
+                        prefix: _prefix,
+                        backend,
+                        options,
+                        source,
+                    } => {
+                        oi.tool_request = ToolRequest::Prefix {
                             backend,
                             options,
                             source,
-                        } => {
-                            oi.tool_request = ToolRequest::Prefix {
-                                backend,
-                                options,
-                                source,
-                                prefix: format!("{prefix}{bumped_version}"),
-                            };
-                            Some(oi.tool_request.version())
-                        }
-                        _ => {
-                            warn!("upgrading non-version tool requests");
-                            None
-                        }
+                            prefix: format!("{prefix}{bumped_version}"),
+                        };
+                        Some(oi.tool_request.version())
+                    }
+                    _ => {
+                        warn!("upgrading non-version tool requests");
+                        None
                     }
                 }
             }

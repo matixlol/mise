@@ -1,9 +1,10 @@
 use crate::Result;
-use crate::backend::asset_detector::detect_platform_from_url;
+use crate::backend::asset_matcher::detect_platform_from_url;
 use crate::backend::static_helpers::get_filename_from_url;
-use crate::config::Settings;
 use crate::file::{self, TarFormat, TarOptions};
 use crate::http::HTTP;
+use crate::minisign;
+use crate::ui::info;
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
 use clap::ValueHint;
@@ -14,7 +15,7 @@ use std::path::PathBuf;
 use toml_edit::DocumentMut;
 use xx::file::display_path;
 
-/// [experimental] Generate a tool stub for HTTP-based tools
+/// Generate a tool stub for HTTP-based tools
 ///
 /// This command generates tool stubs that can automatically download and execute
 /// tools from HTTP URLs. It can detect checksums, file sizes, and binary paths
@@ -30,15 +31,44 @@ pub struct ToolStub {
     #[clap(value_hint = ValueHint::FilePath)]
     pub output: PathBuf,
 
-    /// Version of the tool
-    #[clap(long, default_value = "latest")]
-    pub version: String,
-
-    /// URL for downloading the tool
+    /// Binary path within the extracted archive
     ///
-    /// Example: https://github.com/owner/repo/releases/download/v2.0.0/tool-linux-x64.tar.gz
+    /// If not specified and the archive is downloaded, will auto-detect the most likely binary
     #[clap(long, short)]
-    pub url: Option<String>,
+    pub bin: Option<String>,
+
+    /// Wrap stub in a bootstrap script that installs mise if not already present
+    ///
+    /// When enabled, generates a bash script that:
+    /// 1. Checks if mise is installed at the expected path
+    /// 2. If not, downloads and installs mise using the embedded installer
+    /// 3. Executes the tool stub using mise
+    #[clap(long, verbatim_doc_comment)]
+    pub bootstrap: bool,
+
+    /// Specify mise version for the bootstrap script
+    ///
+    /// By default, uses the latest version from the install script.
+    /// Use this to pin to a specific version (e.g., "2025.1.0").
+    #[clap(long, verbatim_doc_comment, requires = "bootstrap")]
+    pub bootstrap_version: Option<String>,
+
+    /// Fetch checksums and sizes for an existing tool stub file
+    ///
+    /// This reads an existing stub file and fills in any missing checksum/size fields
+    /// by downloading the files. URLs must already be present in the stub.
+    #[clap(long, conflicts_with_all = &["url", "platform_url", "version", "bin", "platform_bin", "skip_download"])]
+    pub fetch: bool,
+
+    /// HTTP backend type to use
+    #[clap(long, default_value = "http")]
+    pub http: String,
+
+    /// Platform-specific binary paths in the format platform:path
+    ///
+    /// Examples: --platform-bin windows-x64:tool.exe --platform-bin linux-x64:bin/tool
+    #[clap(long)]
+    pub platform_bin: Vec<String>,
 
     /// Platform-specific URLs in the format platform:url or just url (auto-detect platform)
     ///
@@ -54,38 +84,23 @@ pub struct ToolStub {
     #[clap(long)]
     pub platform_url: Vec<String>,
 
-    /// Platform-specific binary paths in the format platform:path
-    ///
-    /// Examples: --platform-bin windows-x64:tool.exe --platform-bin linux-x64:bin/tool
-    #[clap(long)]
-    pub platform_bin: Vec<String>,
-
-    /// Binary path within the extracted archive
-    ///
-    /// If not specified and the archive is downloaded, will auto-detect the most likely binary
-    #[clap(long, short)]
-    pub bin: Option<String>,
-
     /// Skip downloading for checksum and binary path detection (faster but less informative)
     #[clap(long)]
     pub skip_download: bool,
 
-    /// Fetch checksums and sizes for an existing tool stub file
+    /// URL for downloading the tool
     ///
-    /// This reads an existing stub file and fills in any missing checksum/size fields
-    /// by downloading the files. URLs must already be present in the stub.
-    #[clap(long, conflicts_with_all = &["url", "platform_url", "version", "bin", "platform_bin", "skip_download"])]
-    pub fetch: bool,
+    /// Example: https://github.com/owner/repo/releases/download/v2.0.0/tool-linux-x64.tar.gz
+    #[clap(long, short)]
+    pub url: Option<String>,
 
-    /// HTTP backend type to use
-    #[clap(long, default_value = "http")]
-    pub http: String,
+    /// Version of the tool
+    #[clap(long, default_value = "latest")]
+    pub version: String,
 }
 
 impl ToolStub {
     pub async fn run(self) -> Result<()> {
-        Settings::get().ensure_experimental("generate tool-stub")?;
-
         let stub_content = if self.fetch {
             self.fetch_checksums().await?
         } else {
@@ -124,12 +139,7 @@ impl ToolStub {
         // Read existing file if it exists
         let (existing_content, mut doc) = if self.output.exists() {
             let content = file::read_to_string(&self.output)?;
-            // Extract TOML content from the stub file (skip shebang and comments)
-            let toml_content = content
-                .lines()
-                .skip_while(|line| line.starts_with('#') || line.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
+            let toml_content = extract_toml_from_stub(&content);
 
             let document = toml_content.parse::<DocumentMut>()?;
             (Some(content), document)
@@ -162,10 +172,10 @@ impl ToolStub {
             .unwrap_or("");
 
         // Update bin if provided and different from stub filename
-        if let Some(bin) = &self.bin {
-            if bin != stub_filename {
-                doc["bin"] = toml_edit::value(bin);
-            }
+        if let Some(bin) = &self.bin
+            && bin != stub_filename
+        {
+            doc["bin"] = toml_edit::value(bin);
         }
 
         // We use toml_edit directly to preserve existing content
@@ -188,12 +198,12 @@ impl ToolStub {
                 }
                 doc["size"] = size_item;
 
-                if self.bin.is_none() {
-                    if let Some(detected_bin) = bin_path.as_ref() {
-                        // Only set bin if it's different from the stub filename
-                        if detected_bin != stub_filename {
-                            doc["bin"] = toml_edit::value(detected_bin);
-                        }
+                if self.bin.is_none()
+                    && let Some(detected_bin) = bin_path.as_ref()
+                {
+                    // Only set bin if it's different from the stub filename
+                    if detected_bin != stub_filename {
+                        doc["bin"] = toml_edit::value(detected_bin);
                     }
                 }
             }
@@ -233,10 +243,10 @@ impl ToolStub {
                 platform_table["url"] = toml_edit::value(&url);
 
                 // Set platform-specific bin path if explicitly provided and different from stub filename
-                if let Some(explicit_bin) = explicit_platform_bins.get(&platform) {
-                    if explicit_bin != stub_filename {
-                        platform_table["bin"] = toml_edit::value(explicit_bin);
-                    }
+                if let Some(explicit_bin) = explicit_platform_bins.get(&platform)
+                    && explicit_bin != stub_filename
+                {
+                    platform_table["bin"] = toml_edit::value(explicit_bin);
                 }
 
                 // Auto-detect checksum, size, and bin path if not skipped
@@ -258,12 +268,12 @@ impl ToolStub {
                     }
 
                     // Set bin path if not explicitly provided and we detected one different from stub filename
-                    if !explicit_platform_bins.contains_key(&platform) && self.bin.is_none() {
-                        if let Some(detected_bin) = bin_path.as_ref() {
-                            if detected_bin != stub_filename {
-                                platform_table["bin"] = toml_edit::value(detected_bin);
-                            }
-                        }
+                    if !explicit_platform_bins.contains_key(&platform)
+                        && self.bin.is_none()
+                        && let Some(detected_bin) = bin_path.as_ref()
+                        && detected_bin != stub_filename
+                    {
+                        platform_table["bin"] = toml_edit::value(detected_bin);
                     }
                 }
             }
@@ -281,12 +291,11 @@ impl ToolStub {
                 // Remove platform-specific bin entries since we'll have a global one
                 for platform_spec in &self.platform_url {
                     let (platform, _) = self.parse_platform_spec(platform_spec)?;
-                    if let Some(platform_table) = platforms.get_mut(&platform) {
-                        if let Some(table) = platform_table.as_table_mut() {
-                            if !explicit_platform_bins.contains_key(&platform) {
-                                table.remove("bin");
-                            }
-                        }
+                    if let Some(platform_table) = platforms.get_mut(&platform)
+                        && let Some(table) = platform_table.as_table_mut()
+                        && !explicit_platform_bins.contains_key(&platform)
+                    {
+                        table.remove("bin");
                     }
                 }
                 // Now set the global bin if different from stub filename
@@ -298,14 +307,84 @@ impl ToolStub {
 
         let toml_content = doc.to_string();
 
-        let mut content = vec![
-            "#!/usr/bin/env -S mise tool-stub".to_string(),
-            "".to_string(),
-        ];
+        // Check if we should use bootstrap format:
+        // 1. If --bootstrap flag is explicitly set
+        // 2. If existing file was a bootstrap stub (preserve format when appending)
+        let use_bootstrap = self.bootstrap
+            || existing_content
+                .as_ref()
+                .map(|c| is_bootstrap_stub(c))
+                .unwrap_or(false);
 
-        content.push(toml_content);
+        if use_bootstrap {
+            self.wrap_with_bootstrap(&toml_content).await
+        } else {
+            let mut content = vec![
+                "#!/usr/bin/env -S mise tool-stub".to_string(),
+                "".to_string(),
+            ];
 
-        Ok(content.join("\n"))
+            content.push(toml_content);
+
+            Ok(content.join("\n"))
+        }
+    }
+
+    async fn wrap_with_bootstrap(&self, toml_content: &str) -> Result<String> {
+        // Fetch and verify install.sh (same approach as bootstrap.rs)
+        // Use versioned URL if a specific version is requested
+        let url = if let Some(v) = &self.bootstrap_version {
+            format!("https://mise.jdx.dev/v{v}/install.sh")
+        } else {
+            "https://mise.jdx.dev/install.sh".to_string()
+        };
+        let install = HTTP.get_text(&url).await?;
+        let install_sig = HTTP.get_text(format!("{url}.minisig")).await?;
+        minisign::verify(&minisign::MISE_PUB_KEY, install.as_bytes(), &install_sig)?;
+        let install = info::indent_by(install, "        ");
+
+        // Store TOML in a comment block - mise tool-stub will parse this from the script
+        let commented_toml = toml_content
+            .lines()
+            .map(|line| format!("# {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Ok(format!(
+            r##"#!/usr/bin/env bash
+set -eu
+
+# MISE_TOOL_STUB:
+{commented_toml}
+# :MISE_TOOL_STUB
+
+__mise_tool_stub_bootstrap() {{
+    # Check if mise is on PATH first
+    if command -v mise &>/dev/null; then
+        MISE_BIN="$(command -v mise)"
+        return
+    fi
+
+    # Fall back to ~/.local/bin/mise
+    MISE_BIN="$HOME/.local/bin/mise"
+    if [ -f "$MISE_BIN" ]; then
+        return
+    fi
+
+    # Install mise to ~/.local/bin
+    install() {{
+        local initial_working_dir="$PWD"
+{install}
+        cd -- "$initial_working_dir"
+    }}
+    local MISE_INSTALL_HELP=0
+    install
+}}
+__mise_tool_stub_bootstrap
+
+exec "$MISE_BIN" tool-stub "$0" "$@"
+"##
+        ))
     }
 
     fn parse_platform_spec(&self, spec: &str) -> Result<(String, String)> {
@@ -478,10 +557,10 @@ impl ToolStub {
             let entry = entry?;
             if entry.file_type().is_file() {
                 let path = entry.path();
-                if file::is_executable(path) {
-                    if let Ok(relative_path) = path.strip_prefix(dir) {
-                        executables.push(relative_path.to_string_lossy().to_string());
-                    }
+                if file::is_executable(path)
+                    && let Ok(relative_path) = path.strip_prefix(dir)
+                {
+                    executables.push(relative_path.to_string_lossy().to_string());
                 }
             }
         }
@@ -503,10 +582,10 @@ impl ToolStub {
                     return Ok(exe.clone());
                 }
                 // Check filename without extension
-                if let Some(stem) = path.file_stem().and_then(|f| f.to_str()) {
-                    if stem == tool_name {
-                        return Ok(exe.clone());
-                    }
+                if let Some(stem) = path.file_stem().and_then(|f| f.to_str())
+                    && stem == tool_name
+                {
+                    return Ok(exe.clone());
                 }
             }
         }
@@ -578,14 +657,7 @@ impl ToolStub {
         }
 
         let content = file::read_to_string(&self.output)?;
-
-        // Extract TOML content from the stub file (skip shebang)
-        let toml_content = content
-            .lines()
-            .skip_while(|line| line.starts_with('#') || line.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-
+        let toml_content = extract_toml_from_stub(&content);
         let mut doc = toml_content.parse::<DocumentMut>()?;
         let mpr = MultiProgressReport::get();
 
@@ -609,28 +681,28 @@ impl ToolStub {
         // Process platform-specific URLs
         if let Some(platforms) = doc.get_mut("platforms").and_then(|p| p.as_table_mut()) {
             for (platform_name, platform_value) in platforms.iter_mut() {
-                if let Some(platform_table) = platform_value.as_table_mut() {
-                    if let Some(url) = platform_table.get("url").and_then(|v| v.as_str()) {
-                        // Only fetch if checksum is missing for this platform
-                        if platform_table.get("checksum").is_none() {
-                            match self.analyze_url(url, &mpr).await {
-                                Ok((checksum, size, _)) => {
-                                    platform_table["checksum"] = toml_edit::value(&checksum);
+                if let Some(platform_table) = platform_value.as_table_mut()
+                    && let Some(url) = platform_table.get("url").and_then(|v| v.as_str())
+                {
+                    // Only fetch if checksum is missing for this platform
+                    if platform_table.get("checksum").is_none() {
+                        match self.analyze_url(url, &mpr).await {
+                            Ok((checksum, size, _)) => {
+                                platform_table["checksum"] = toml_edit::value(&checksum);
 
-                                    // Create size entry with human-readable comment
-                                    let mut size_item = toml_edit::value(size as i64);
-                                    if let Some(value) = size_item.as_value_mut() {
-                                        let formatted_comment = format_size_comment(size);
-                                        value.decor_mut().set_suffix(formatted_comment);
-                                    }
-                                    platform_table["size"] = size_item;
+                                // Create size entry with human-readable comment
+                                let mut size_item = toml_edit::value(size as i64);
+                                if let Some(value) = size_item.as_value_mut() {
+                                    let formatted_comment = format_size_comment(size);
+                                    value.decor_mut().set_suffix(formatted_comment);
                                 }
-                                Err(e) => {
-                                    // Log error but continue with other platforms
-                                    eprintln!(
-                                        "Warning: Failed to fetch checksum for platform '{platform_name}': {e}"
-                                    );
-                                }
+                                platform_table["size"] = size_item;
+                            }
+                            Err(e) => {
+                                // Log error but continue with other platforms
+                                eprintln!(
+                                    "Warning: Failed to fetch checksum for platform '{platform_name}': {e}"
+                                );
                             }
                         }
                     }
@@ -640,19 +712,61 @@ impl ToolStub {
 
         let toml_content = doc.to_string();
 
-        let mut content = vec![
-            "#!/usr/bin/env -S mise tool-stub".to_string(),
-            "".to_string(),
-        ];
+        // Check if original was a bootstrap stub and preserve that format
+        if is_bootstrap_stub(&content) {
+            self.wrap_with_bootstrap(&toml_content).await
+        } else {
+            let mut output = vec![
+                "#!/usr/bin/env -S mise tool-stub".to_string(),
+                "".to_string(),
+            ];
 
-        content.push(toml_content);
+            output.push(toml_content);
 
-        Ok(content.join("\n"))
+            Ok(output.join("\n"))
+        }
     }
+}
+
+/// Check if content is a bootstrap stub
+fn is_bootstrap_stub(content: &str) -> bool {
+    content.contains("# MISE_TOOL_STUB:") && content.contains("# :MISE_TOOL_STUB")
 }
 
 fn format_size_comment(bytes: u64) -> String {
     format!(" # {}", format_size(bytes, BINARY))
+}
+
+/// Extract TOML content from a stub file (handles both regular and bootstrap stubs)
+fn extract_toml_from_stub(content: &str) -> String {
+    // Check if this is a bootstrap stub by looking for comment markers
+    if is_bootstrap_stub(content) {
+        // Bootstrap stub: extract TOML between comment markers
+        let start_marker = "# MISE_TOOL_STUB:";
+        let end_marker = "# :MISE_TOOL_STUB";
+
+        if let (Some(start_pos), Some(end_pos)) =
+            (content.find(start_marker), content.find(end_marker))
+            && start_pos < end_pos
+        {
+            let between = &content[start_pos + start_marker.len()..end_pos];
+            return between
+                .lines()
+                .map(|line| line.strip_prefix("# ").unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+        }
+        String::new()
+    } else {
+        // Regular stub: skip shebang and comments at the start
+        content
+            .lines()
+            .skip_while(|line| line.starts_with('#') || line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 static AFTER_LONG_HELP: &str = color_print::cstr!(
@@ -690,5 +804,12 @@ static AFTER_LONG_HELP: &str = color_print::cstr!(
     Fetch checksums for an existing stub:
     $ <bold>mise generate tool-stub ./bin/jq --fetch</bold>
     # This will read the existing stub and download files to fill in any missing checksums/sizes
+
+    Generate a bootstrap stub that installs mise if needed:
+    $ <bold>mise generate tool-stub ./bin/tool --url "https://example.com/tool.tar.gz" --bootstrap</bold>
+    # The stub will check for mise and install it automatically before running the tool
+
+    Generate a bootstrap stub with a pinned mise version:
+    $ <bold>mise generate tool-stub ./bin/tool --url "https://example.com/tool.tar.gz" --bootstrap --bootstrap-version 2025.1.0</bold>
 "#
 );

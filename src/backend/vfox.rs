@@ -10,7 +10,9 @@ use std::thread;
 use tokio::sync::RwLock;
 
 use crate::backend::Backend;
+use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
+use crate::backend::platform_target::PlatformTarget;
 use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::cli::args::BackendArg;
 use crate::config::{Config, Settings};
@@ -46,7 +48,7 @@ impl Backend for VfoxBackend {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<String>> {
+    async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
         let this = self;
         timeout::run_with_timeout_async(
             || async {
@@ -54,20 +56,21 @@ impl Backend for VfoxBackend {
                 this.ensure_plugin_installed(config).await?;
 
                 // Use backend methods if the plugin supports them
-                if matches!(&this.plugin_enum, PluginEnum::VfoxBackend(_)) {
+                if this.is_backend_plugin() {
+                    Settings::get().ensure_experimental("custom backends")?;
                     debug!("Using backend method for plugin: {}", this.pathname);
-                    let tool_name = this.tool_name.as_ref().ok_or_else(|| {
-                        eyre::eyre!("VfoxBackend requires a tool name (plugin:tool format)")
-                    })?;
-                    match vfox.backend_list_versions(&this.pathname, tool_name).await {
-                        Ok(versions) => {
-                            return Ok(versions);
-                        }
-                        Err(e) => {
-                            debug!("Backend method failed: {}", e);
-                            return Err(e).wrap_err("Backend list versions method failed");
-                        }
-                    }
+                    let tool_name = this.get_tool_name()?;
+                    let versions = vfox
+                        .backend_list_versions(&this.pathname, tool_name)
+                        .await
+                        .wrap_err("Backend list versions method failed")?;
+                    return Ok(versions
+                        .into_iter()
+                        .map(|v| VersionInfo {
+                            version: v,
+                            ..Default::default()
+                        })
+                        .collect());
                 }
 
                 // Use default vfox behavior for traditional plugins
@@ -75,8 +78,11 @@ impl Backend for VfoxBackend {
                 Ok(versions
                     .into_iter()
                     .rev()
-                    .map(|v| v.version)
-                    .collect::<Vec<String>>())
+                    .map(|v| VersionInfo {
+                        version: v.version,
+                        ..Default::default()
+                    })
+                    .collect())
             },
             Settings::get().fetch_remote_versions_timeout(),
         )
@@ -98,21 +104,13 @@ impl Backend for VfoxBackend {
         });
 
         // Use backend methods if the plugin supports them
-        if matches!(&self.plugin_enum, PluginEnum::VfoxBackend(_)) {
-            let tool_name = self.tool_name.as_ref().ok_or_else(|| {
-                eyre::eyre!("VfoxBackend requires a tool name (plugin:tool format)")
-            })?;
-            match vfox
-                .backend_install(&self.pathname, tool_name, &tv.version, tv.install_path())
+        if self.is_backend_plugin() {
+            Settings::get().ensure_experimental("custom backends")?;
+            let tool_name = self.get_tool_name()?;
+            vfox.backend_install(&self.pathname, tool_name, &tv.version, tv.install_path())
                 .await
-            {
-                Ok(_response) => {
-                    return Ok(tv);
-                }
-                Err(e) => {
-                    return Err(e).wrap_err("Backend install method failed");
-                }
-            }
+                .wrap_err("Backend install method failed")?;
+            return Ok(tv);
         }
 
         // Use default vfox behavior for traditional plugins
@@ -172,9 +170,45 @@ impl Backend for VfoxBackend {
             )
         })
     }
+
+    async fn get_tarball_url(
+        &self,
+        tv: &ToolVersion,
+        target: &PlatformTarget,
+    ) -> eyre::Result<Option<String>> {
+        let config = Config::get().await?;
+        self.ensure_plugin_installed(&config).await?;
+
+        // Map mise platform names to vfox platform names
+        let os = match target.os_name() {
+            "macos" => "darwin",
+            os => os,
+        };
+        let arch = match target.arch_name() {
+            "x64" => "amd64",
+            arch => arch,
+        };
+
+        let (vfox, _log_rx) = self.plugin.vfox();
+        let pre_install = vfox
+            .pre_install_for_platform(&self.pathname, &tv.version, os, arch)
+            .await?;
+
+        Ok(pre_install.url)
+    }
 }
 
 impl VfoxBackend {
+    fn is_backend_plugin(&self) -> bool {
+        matches!(&self.plugin_enum, PluginEnum::VfoxBackend(_))
+    }
+
+    fn get_tool_name(&self) -> eyre::Result<&str> {
+        self.tool_name
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("VfoxBackend requires a tool name (plugin:tool format)"))
+    }
+
     pub fn from_arg(ba: BackendArg, backend_plugin_name: Option<String>) -> Self {
         let pathname = match &backend_plugin_name {
             Some(plugin_name) => plugin_name.clone(),
@@ -211,12 +245,20 @@ impl VfoxBackend {
         config: &Arc<Config>,
         tv: &ToolVersion,
     ) -> eyre::Result<BTreeMap<String, String>> {
-        let key = tv.to_string();
+        let opts = tv.request.options();
+        let opts_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            opts.hash(&mut hasher);
+            hasher.finish()
+        };
+        let key = format!("{}:{:x}", tv, opts_hash);
+        let cache_file = format!("exec_env_{:x}.msgpack.z", opts_hash);
         if !self.exec_env_cache.read().await.contains_key(&key) {
             let mut caches = self.exec_env_cache.write().await;
             caches.insert(
                 key.clone(),
-                CacheManagerBuilder::new(tv.cache_path().join("exec_env.msgpack.z"))
+                CacheManagerBuilder::new(tv.cache_path().join(&cache_file))
                     .with_fresh_file(dirs::DATA.to_path_buf())
                     .with_fresh_file(self.plugin.plugin_path.to_path_buf())
                     .with_fresh_file(self.ba().installs_path.to_path_buf())
@@ -231,63 +273,32 @@ impl VfoxBackend {
                 let (vfox, _log_rx) = self.plugin.vfox();
 
                 // Use backend methods if the plugin supports them
-                if matches!(&self.plugin_enum, PluginEnum::VfoxBackend(_)) {
-                    let tool_name = self.tool_name.as_ref().ok_or_else(|| {
-                        eyre::eyre!("VfoxBackend requires a tool name (plugin:tool format)")
-                    })?;
-                    match vfox
-                        .backend_exec_env(&self.pathname, tool_name, &tv.version, tv.install_path())
+                let env_keys = if self.is_backend_plugin() {
+                    let tool_name = self.get_tool_name()?;
+                    vfox.backend_exec_env(&self.pathname, tool_name, &tv.version, tv.install_path())
                         .await
-                    {
-                        Ok(response) => {
-                            return Ok(response.into_iter().fold(
-                                BTreeMap::new(),
-                                |mut acc, env_key| {
-                                    let key = &env_key.key;
-                                    if let Some(val) = acc.get(key) {
-                                        let mut paths =
-                                            env::split_paths(val).collect::<Vec<PathBuf>>();
-                                        paths.push(PathBuf::from(env_key.value));
-                                        acc.insert(
-                                            env_key.key,
-                                            env::join_paths(paths)
-                                                .unwrap()
-                                                .to_string_lossy()
-                                                .to_string(),
-                                        );
-                                    } else {
-                                        acc.insert(key.clone(), env_key.value);
-                                    }
-                                    acc
-                                },
-                            ));
-                        }
-                        Err(e) => {
-                            debug!("Backend method failed: {}", e);
-                            return Err(e).wrap_err("Backend exec env method failed");
-                        }
-                    }
-                }
+                        .wrap_err("Backend exec env method failed")?
+                } else {
+                    vfox.env_keys(&self.pathname, &tv.version, &opts.opts)
+                        .await?
+                };
 
-                // Use default vfox behavior for traditional plugins
-                Ok(vfox
-                    .env_keys(&self.pathname, &tv.version)
-                    .await?
+                Ok(env_keys
                     .into_iter()
                     .fold(BTreeMap::new(), |mut acc, env_key| {
                         let key = &env_key.key;
                         if let Some(val) = acc.get(key) {
                             let mut paths = env::split_paths(val).collect::<Vec<PathBuf>>();
-                            paths.push(PathBuf::from(env_key.value));
+                            paths.push(PathBuf::from(&env_key.value));
                             acc.insert(
-                                env_key.key,
+                                env_key.key.clone(),
                                 env::join_paths(paths)
                                     .unwrap()
                                     .to_string_lossy()
                                     .to_string(),
                             );
                         } else {
-                            acc.insert(key.clone(), env_key.value);
+                            acc.insert(key.clone(), env_key.value.clone());
                         }
                         acc
                     }))

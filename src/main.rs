@@ -61,11 +61,13 @@ pub(crate) mod logger;
 pub(crate) mod maplit;
 mod migrate;
 mod minisign;
+mod netrc;
 pub(crate) mod parallel;
 mod path;
 mod path_env;
 mod platform;
 mod plugins;
+mod prepare;
 mod rand;
 mod redactions;
 mod registry;
@@ -138,10 +140,10 @@ async fn main_() -> eyre::Result<()> {
 }
 
 fn handle_err(err: Report) -> eyre::Result<()> {
-    if let Some(err) = err.downcast_ref::<std::io::Error>() {
-        if err.kind() == std::io::ErrorKind::BrokenPipe {
-            return Ok(());
-        }
+    if let Some(err) = err.downcast_ref::<std::io::Error>()
+        && err.kind() == std::io::ErrorKind::BrokenPipe
+    {
+        return Ok(());
     }
     show_github_rate_limit_err(&err);
     if *env::MISE_FRIENDLY_ERROR {

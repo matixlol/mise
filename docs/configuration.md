@@ -184,17 +184,26 @@ _new_ plugin installations. Existing plugins can use any URL.
 [plugins]
 elixir = "https://github.com/my-org/mise-elixir.git"
 node = "https://github.com/my-org/mise-node.git#DEADBEEF" # supports specific gitref
+"vfox-backend:myplugin" = "https://github.com/jdx/vfox-npm"
 ```
 
+The plugin type prefix (e.g., `asdf:`, `vfox:` or `vfox-backend:`) is optional. If omitted, mise will fall back to
+either using `asdf` or `vfox` if the URL contains `vfox-` in the repo name.
+
 If you simply want to install a plugin from a specific URL once, it's better to use
-`mise plugin install plugin <GIT_URL>`. Add this section to `mise.toml` if you want
+`mise plugin install <NAME> <GIT_URL>`. Add this section to `mise.toml` if you want
 to share the plugin location/revision with other developers in your project.
 
 This is similar
 to [`MISE_SHORTHANDS`](https://github.com/jdx/mise#mise_shorthands_fileconfigmiseshorthandstoml)
 but doesn't require a separate file.
 
-### `[alias]` - Tool version aliases
+### `[tool_alias]` - Tool version aliases
+
+::: tip
+`[alias]` has been renamed to `[tool_alias]` to distinguish it from `[shell_alias]`.
+The old `[alias]` key still works but is deprecated.
+:::
 
 The following makes `mise install node@my_custom_node` install node-20.x
 this can also be specified in a [plugin](/dev-tools/aliases.md).
@@ -205,8 +214,23 @@ note adding an alias will also add a symlink, in this case:
 ```
 
 ```toml
+[tool_alias.node.versions]
 my_custom_node = '20'
 ```
+
+### `[shell_alias]` - Shell aliases
+
+Define shell aliases that are set when entering a directory and unset when leaving:
+
+```toml
+[shell_alias]
+ll = "ls -la"
+gs = "git status"
+dev = "npm run dev"
+```
+
+These work similar to environment variables—they're set dynamically based on your current directory.
+See [Shell Aliases](/shell-aliases) for more details.
 
 ### Minimum mise version
 
@@ -278,7 +302,7 @@ always_keep_install = false         # deleted on failure by default
 
 # configure how frequently (in minutes) to fetch updated plugin repository changes
 # this is updated whenever a new runtime is installed
-# (note: this isn't currently implemented but there are plans to add it: https://github.com/jdx/mise/issues/128)
+# (note: this isn't currently implemented but there are plans to add it: https://github.com/jdx/mise/discussions/6735)
 plugin_autoupdate_last_check_duration = '1 week' # set to 0 to disable updates
 
 # config files with these prefixes will be trusted by default
@@ -382,7 +406,7 @@ in mise and nvm. Here are some of the supported idiomatic version files:
 | terramate  | `.terramate-version`                  |
 | yarn       | `.yvmrc`                              |
 
-In mise, these are enabled by default. However, in 2025.10.0 they will default to disabled (see <https://github.com/jdx/mise/discussions/4345>).
+In mise, these are disabled by default, see <https://github.com/jdx/mise/discussions/4345> for rationale.
 
 - `mise settings add idiomatic_version_file_enable_tools python` for a specific tool such as Python ([docs](/configuration/settings.html#idiomatic_version_file_enable_tools))
 

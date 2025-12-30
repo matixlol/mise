@@ -41,7 +41,6 @@ pub async fn uv_venv(config: &Arc<Config>, ts: &Toolset) -> &'static Option<Venv
 }
 
 async fn get_or_create_venv(ts: &Toolset, venv_path: PathBuf, uv_path: PathBuf) -> Result<Venv> {
-    Settings::get().ensure_experimental("uv venv auto")?;
     #[cfg(windows)]
     let venv_bin_dir = "Scripts";
     #[cfg(not(windows))]
@@ -68,6 +67,9 @@ async fn get_or_create_venv(ts: &Toolset, venv_path: PathBuf, uv_path: PathBuf) 
             .arg("venv");
         if !log::log_enabled!(log::Level::Debug) {
             cmd = cmd.arg("--quiet");
+        }
+        if let Some(extra) = Settings::get().python.uv_venv_create_args.clone() {
+            cmd = cmd.args(extra);
         }
         cmd.execute()?;
     }

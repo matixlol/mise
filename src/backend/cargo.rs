@@ -1,21 +1,24 @@
+use std::collections::BTreeMap;
 use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 use color_eyre::Section;
 use eyre::{bail, eyre};
-use serde_json::Deserializer;
 use url::Url;
 
 use crate::Result;
 use crate::backend::Backend;
+use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
+use crate::backend::platform_target::PlatformTarget;
+use crate::backend::static_helpers::lookup_platform_key;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings};
 use crate::env::GITHUB_TOKEN;
 use crate::http::HTTP_FETCH;
 use crate::install_context::InstallContext;
-use crate::toolset::ToolVersion;
+use crate::toolset::{ToolRequest, ToolVersion};
 use crate::{env, file};
 
 #[derive(Debug)]
@@ -41,22 +44,34 @@ impl Backend for CargoBackend {
         Ok(vec!["cargo-binstall", "sccache"])
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<String>> {
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
         if self.git_url().is_some() {
             // TODO: maybe fetch tags/branches from git?
-            return Ok(vec!["HEAD".into()]);
+            return Ok(vec![VersionInfo {
+                version: "HEAD".into(),
+                ..Default::default()
+            }]);
         }
-        let raw = HTTP_FETCH
-            .get_text(get_crate_url(&self.tool_name())?)
-            .await?;
-        let stream = Deserializer::from_str(&raw).into_iter::<CrateVersion>();
-        let mut versions = vec![];
-        for v in stream {
-            let v = v?;
-            if !v.yanked {
-                versions.push(v.vers);
-            }
-        }
+
+        // Use crates.io API which includes created_at timestamps
+        let url = format!(
+            "https://crates.io/api/v1/crates/{}/versions",
+            self.tool_name()
+        );
+        let response: CratesIoVersionsResponse = HTTP_FETCH.json(&url).await?;
+
+        let versions = response
+            .versions
+            .into_iter()
+            .filter(|v| !v.yanked)
+            .map(|v| VersionInfo {
+                version: v.num,
+                created_at: Some(v.created_at),
+                ..Default::default()
+            })
+            .rev() // API returns newest first, we want oldest first
+            .collect();
+
         Ok(versions)
     }
 
@@ -105,7 +120,7 @@ impl Backend for CargoBackend {
         };
 
         let opts = tv.request.options();
-        if let Some(bin) = opts.get("bin") {
+        if let Some(bin) = lookup_platform_key(&opts, "bin").or_else(|| opts.get("bin").cloned()) {
             cmd = cmd.arg(format!("--bin={bin}"));
         }
         if opts
@@ -117,10 +132,10 @@ impl Backend for CargoBackend {
         if let Some(features) = opts.get("features") {
             cmd = cmd.arg(format!("--features={features}"));
         }
-        if let Some(default_features) = opts.get("default-features") {
-            if default_features.to_lowercase() == "false" {
-                cmd = cmd.arg("--no-default-features");
-            }
+        if let Some(default_features) = opts.get("default-features")
+            && default_features.to_lowercase() == "false"
+        {
+            cmd = cmd.arg("--no-default-features");
         }
         if let Some(c) = opts.get("crate") {
             cmd = cmd.arg(c);
@@ -144,6 +159,29 @@ impl Backend for CargoBackend {
 
         Ok(tv.clone())
     }
+
+    fn resolve_lockfile_options(
+        &self,
+        request: &ToolRequest,
+        _target: &PlatformTarget,
+    ) -> BTreeMap<String, String> {
+        let opts = request.options();
+        let mut result = BTreeMap::new();
+
+        // These options affect what gets compiled/installed
+        for key in ["features", "default-features", "bin"] {
+            if let Some(value) = opts.get(key) {
+                result.insert(key.to_string(), value.clone());
+            }
+        }
+
+        result
+    }
+}
+
+/// Returns install-time-only option keys for Cargo backend.
+pub fn install_time_option_keys() -> Vec<String> {
+    vec!["features".into(), "default-features".into(), "bin".into()]
 }
 
 impl CargoBackend {
@@ -187,20 +225,14 @@ impl CargoBackend {
     }
 }
 
-fn get_crate_url(n: &str) -> eyre::Result<Url> {
-    let n = n.to_lowercase();
-    let url = match n.len() {
-        1 => format!("https://index.crates.io/1/{n}"),
-        2 => format!("https://index.crates.io/2/{n}"),
-        3 => format!("https://index.crates.io/3/{}/{n}", &n[..1]),
-        _ => format!("https://index.crates.io/{}/{}/{n}", &n[..2], &n[2..4]),
-    };
-    Ok(url.parse()?)
+#[derive(Debug, serde::Deserialize)]
+struct CratesIoVersionsResponse {
+    versions: Vec<CratesIoVersion>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct CrateVersion {
-    //name: String,
-    vers: String,
+struct CratesIoVersion {
+    num: String,
     yanked: bool,
+    created_at: String,
 }

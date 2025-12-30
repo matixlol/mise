@@ -79,10 +79,10 @@ static CLI_SETTINGS: Mutex<Option<SettingsPartial>> = Mutex::new(None);
 static DEFAULT_SETTINGS: Lazy<SettingsPartial> = Lazy::new(|| {
     let mut s = SettingsPartial::empty();
     s.python.default_packages_file = Some(env::HOME.join(".default-python-packages"));
-    if let Some("alpine" | "nixos") = env::LINUX_DISTRO.as_ref().map(|s| s.as_str()) {
-        if !cfg!(test) {
-            s.all_compile = Some(true);
-        }
+    if let Some("alpine" | "nixos") = env::LINUX_DISTRO.as_ref().map(|s| s.as_str())
+        && !cfg!(test)
+    {
+        s.all_compile = Some(true);
     }
     s
 });
@@ -190,6 +190,9 @@ impl Settings {
             if settings.erlang.compile.is_none() {
                 settings.erlang.compile = Some(true);
             }
+            if settings.ruby.compile.is_none() {
+                settings.ruby.compile = Some(true);
+            }
         }
         if settings.gpg_verify.is_some() {
             settings.node.gpg_verify = settings.node.gpg_verify.or(settings.gpg_verify);
@@ -255,6 +258,9 @@ impl Settings {
         if let Some(python_venv_auto_create) = self.python_venv_auto_create {
             self.python.venv_auto_create = python_venv_auto_create;
         }
+        if self.npm.bun {
+            self.npm.package_manager = "bun".to_string();
+        }
     }
 
     pub fn add_cli_matches(cli: &Cli) {
@@ -269,6 +275,9 @@ impl Settings {
         if cli.raw {
             s.raw = Some(true);
         }
+        if cli.locked {
+            s.locked = Some(true);
+        }
         if let Some(cd) = &cli.cd {
             s.cd = Some(cd.clone());
         }
@@ -281,22 +290,22 @@ impl Settings {
         if cli.yes {
             s.yes = Some(true);
         }
-        if cli.global_output_flags.quiet {
+        if cli.quiet {
             s.quiet = Some(true);
         }
-        if cli.global_output_flags.trace {
+        if cli.trace {
             s.log_level = Some("trace".to_string());
         }
-        if cli.global_output_flags.debug {
+        if cli.debug {
             s.log_level = Some("debug".to_string());
         }
-        if let Some(log_level) = &cli.global_output_flags.log_level {
+        if let Some(log_level) = &cli.log_level {
             s.log_level = Some(log_level.to_string());
         }
-        if cli.global_output_flags.verbose > 0 {
+        if cli.verbose > 0 {
             s.verbose = Some(true);
         }
-        if cli.global_output_flags.verbose > 1 {
+        if cli.verbose > 1 {
             s.log_level = Some("trace".to_string());
         }
         Self::reset(Some(s));
@@ -375,12 +384,12 @@ impl Settings {
 
     pub fn env_files(&self) -> Vec<PathBuf> {
         let mut files = vec![];
-        if let Some(cwd) = &*dirs::CWD {
-            if let Some(env_file) = &self.env_file {
-                let env_file = env_file.to_string_lossy().to_string();
-                for p in FindUp::new(cwd, &[env_file]) {
-                    files.push(p);
-                }
+        if let Some(cwd) = &*dirs::CWD
+            && let Some(env_file) = &self.env_file
+        {
+            let env_file = env_file.to_string_lossy().to_string();
+            for p in FindUp::new(cwd, &[env_file]) {
+                files.push(p);
             }
         }
         files.into_iter().rev().collect()
@@ -543,8 +552,16 @@ where
 {
     input
         .split(',')
-        .map(T::from_str)
-        // collect into HashSet to remove duplicates
+        // Filter out empty strings
+        .filter_map(|s| {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                Some(T::from_str(trimmed))
+            } else {
+                None
+            }
+        })
+        // collect into BTreeSet to remove duplicates
         .collect::<Result<BTreeSet<_>, _>>()
         .map(|set| set.into_iter().collect())
 }
@@ -553,4 +570,78 @@ where
 /// Expected format: {"source_domain": "replacement_domain", ...}
 pub fn parse_url_replacements(input: &str) -> Result<IndexMap<String, String>, serde_json::Error> {
     serde_json::from_str(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_by_comma_empty_string() {
+        let result: Result<BTreeSet<String>, _> = set_by_comma("");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), BTreeSet::new());
+    }
+
+    #[test]
+    fn test_set_by_comma_whitespace_only() {
+        let result: Result<BTreeSet<String>, _> = set_by_comma("  ");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), BTreeSet::new());
+    }
+
+    #[test]
+    fn test_set_by_comma_single_value() {
+        let result: Result<BTreeSet<String>, _> = set_by_comma("foo");
+        assert!(result.is_ok());
+        let expected: BTreeSet<String> = ["foo".to_string()].into_iter().collect();
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn test_set_by_comma_multiple_values() {
+        let result: Result<BTreeSet<String>, _> = set_by_comma("foo,bar,baz");
+        assert!(result.is_ok());
+        let expected: BTreeSet<String> = ["foo".to_string(), "bar".to_string(), "baz".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn test_set_by_comma_with_whitespace() {
+        let result: Result<BTreeSet<String>, _> = set_by_comma("foo, bar, baz");
+        assert!(result.is_ok());
+        let expected: BTreeSet<String> = ["foo".to_string(), "bar".to_string(), "baz".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn test_set_by_comma_trailing_comma() {
+        let result: Result<BTreeSet<String>, _> = set_by_comma("foo,bar,");
+        assert!(result.is_ok());
+        let expected: BTreeSet<String> =
+            ["foo".to_string(), "bar".to_string()].into_iter().collect();
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn test_set_by_comma_duplicate_values() {
+        let result: Result<BTreeSet<String>, _> = set_by_comma("foo,bar,foo");
+        assert!(result.is_ok());
+        let expected: BTreeSet<String> =
+            ["foo".to_string(), "bar".to_string()].into_iter().collect();
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn test_set_by_comma_empty_elements() {
+        let result: Result<BTreeSet<String>, _> = set_by_comma("foo,,bar");
+        assert!(result.is_ok());
+        let expected: BTreeSet<String> =
+            ["foo".to_string(), "bar".to_string()].into_iter().collect();
+        assert_eq!(result.unwrap(), expected);
+    }
 }

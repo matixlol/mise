@@ -1,5 +1,6 @@
 use crate::Result;
 use crate::backend::Backend;
+use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
 use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::cli::args::BackendArg;
@@ -10,6 +11,7 @@ use crate::timeout;
 use crate::toolset::ToolVersion;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::{fmt::Debug, sync::Arc};
 use tokio::sync::Mutex as TokioMutex;
 
@@ -33,24 +35,41 @@ impl Backend for NPMBackend {
     }
 
     fn get_dependencies(&self) -> eyre::Result<Vec<&str>> {
-        Ok(vec!["node", "bun"])
+        Ok(vec!["node", "bun", "pnpm"])
     }
 
-    async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<String>> {
-        // TODO: Add bun support for listing package versions without npm
-        // Currently bun info requires a package.json file, so we always use npm.
-        // Once bun provides a way to query registry without package.json, we can
-        // switch to using bun when npm.bun=true
+    async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
+        // Use npm CLI to respect custom registry configurations
         self.ensure_npm_for_version_check(config).await;
         timeout::run_with_timeout_async(
             async || {
-                // Always use npm for listing versions since bun info requires package.json
-                // bun is only used for actual package installation
-                let raw = cmd!(NPM_PROGRAM, "view", self.tool_name(), "versions", "--json")
-                    .full_env(self.dependency_env(config).await?)
+                let env = self.dependency_env(config).await?;
+
+                // Fetch versions and timestamps in parallel
+                let versions_raw =
+                    cmd!(NPM_PROGRAM, "view", self.tool_name(), "versions", "--json")
+                        .full_env(&env)
+                        .read()?;
+                let time_raw = cmd!(NPM_PROGRAM, "view", self.tool_name(), "time", "--json")
+                    .full_env(&env)
                     .read()?;
-                let versions: Vec<String> = serde_json::from_str(&raw)?;
-                Ok(versions)
+
+                let versions: Vec<String> = serde_json::from_str(&versions_raw)?;
+                let time: HashMap<String, String> = serde_json::from_str(&time_raw)?;
+
+                let version_info = versions
+                    .into_iter()
+                    .map(|version| {
+                        let created_at = time.get(&version).cloned();
+                        VersionInfo {
+                            version,
+                            created_at,
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+
+                Ok(version_info)
             },
             Settings::get().fetch_remote_versions_timeout(),
         )
@@ -89,42 +108,70 @@ impl Backend for NPMBackend {
 
     async fn install_version_(&self, ctx: &InstallContext, tv: ToolVersion) -> Result<ToolVersion> {
         self.check_install_deps(&ctx.config).await;
-        if Settings::get().npm.bun {
-            CmdLineRunner::new("bun")
-                .arg("install")
-                .arg(format!("{}@{}", self.tool_name(), tv.version))
-                .arg("--global")
-                .arg("--trust")
-                .with_pr(ctx.pr.as_ref())
-                .envs(ctx.ts.env_with_path(&ctx.config).await?)
-                .env("BUN_INSTALL_GLOBAL_DIR", tv.install_path())
-                .env("BUN_INSTALL_BIN", tv.install_path().join("bin"))
-                .prepend_path(ctx.ts.list_paths(&ctx.config).await)?
-                .prepend_path(
-                    self.dependency_toolset(&ctx.config)
-                        .await?
-                        .list_paths(&ctx.config)
-                        .await,
-                )?
-                .current_dir(tv.install_path())
-                .execute()?;
-        } else {
-            CmdLineRunner::new(NPM_PROGRAM)
-                .arg("install")
-                .arg("-g")
-                .arg(format!("{}@{}", self.tool_name(), tv.version))
-                .arg("--prefix")
-                .arg(tv.install_path())
-                .with_pr(ctx.pr.as_ref())
-                .envs(ctx.ts.env_with_path(&ctx.config).await?)
-                .prepend_path(ctx.ts.list_paths(&ctx.config).await)?
-                .prepend_path(
-                    self.dependency_toolset(&ctx.config)
-                        .await?
-                        .list_paths(&ctx.config)
-                        .await,
-                )?
-                .execute()?;
+        match Settings::get().npm.package_manager.as_str() {
+            "bun" => {
+                CmdLineRunner::new("bun")
+                    .arg("install")
+                    .arg(format!("{}@{}", self.tool_name(), tv.version))
+                    .arg("--global")
+                    .arg("--trust")
+                    .with_pr(ctx.pr.as_ref())
+                    .envs(ctx.ts.env_with_path(&ctx.config).await?)
+                    .env("BUN_INSTALL_GLOBAL_DIR", tv.install_path())
+                    .env("BUN_INSTALL_BIN", tv.install_path().join("bin"))
+                    .prepend_path(ctx.ts.list_paths(&ctx.config).await)?
+                    .prepend_path(
+                        self.dependency_toolset(&ctx.config)
+                            .await?
+                            .list_paths(&ctx.config)
+                            .await,
+                    )?
+                    .current_dir(tv.install_path())
+                    .execute()?;
+            }
+            "pnpm" => {
+                let bin_dir = tv.install_path().join("bin");
+                crate::file::create_dir_all(&bin_dir)?;
+                CmdLineRunner::new("pnpm")
+                    .arg("add")
+                    .arg("--global")
+                    .arg(format!("{}@{}", self.tool_name(), tv.version))
+                    .arg("--global-dir")
+                    .arg(tv.install_path())
+                    .arg("--global-bin-dir")
+                    .arg(&bin_dir)
+                    .with_pr(ctx.pr.as_ref())
+                    .envs(ctx.ts.env_with_path(&ctx.config).await?)
+                    .prepend_path(ctx.ts.list_paths(&ctx.config).await)?
+                    .prepend_path(
+                        self.dependency_toolset(&ctx.config)
+                            .await?
+                            .list_paths(&ctx.config)
+                            .await,
+                    )?
+                    // required to avoid pnpm error "global bin dir isn't in PATH"
+                    // https://github.com/pnpm/pnpm/issues/9333
+                    .prepend_path(vec![bin_dir])?
+                    .execute()?;
+            }
+            _ => {
+                CmdLineRunner::new(NPM_PROGRAM)
+                    .arg("install")
+                    .arg("-g")
+                    .arg(format!("{}@{}", self.tool_name(), tv.version))
+                    .arg("--prefix")
+                    .arg(tv.install_path())
+                    .with_pr(ctx.pr.as_ref())
+                    .envs(ctx.ts.env_with_path(&ctx.config).await?)
+                    .prepend_path(ctx.ts.list_paths(&ctx.config).await)?
+                    .prepend_path(
+                        self.dependency_toolset(&ctx.config)
+                            .await?
+                            .list_paths(&ctx.config)
+                            .await,
+                    )?
+                    .execute()?;
+            }
         }
         Ok(tv)
     }
@@ -135,10 +182,10 @@ impl Backend for NPMBackend {
         _config: &Arc<Config>,
         tv: &crate::toolset::ToolVersion,
     ) -> eyre::Result<Vec<std::path::PathBuf>> {
-        if Settings::get().npm.bun {
-            Ok(vec![tv.install_path().join("bin")])
-        } else {
+        if Settings::get().npm.package_manager == "npm" {
             Ok(vec![tv.install_path()])
+        } else {
+            Ok(vec![tv.install_path().join("bin")])
         }
     }
 }
@@ -171,28 +218,40 @@ impl NPMBackend {
 
     /// Check dependencies for package installation (npm or bun based on settings)
     async fn check_install_deps(&self, config: &Arc<Config>) {
-        if Settings::get().npm.bun {
-            // In bun mode, only bun is required for installation
-            self.warn_if_dependency_missing(
-                config,
-                "bun",
-                "To use npm packages with bun, you need to install bun first:\n\
-                  mise use bun@latest\n\n\
-                Or switch back to npm by setting:\n\
-                  mise settings npm.bun=false",
-            )
-            .await
-        } else {
-            // In npm mode, npm is required
-            self.warn_if_dependency_missing(
-                config,
-                "npm", // Use "npm" for dependency check, which will check npm.cmd on Windows
-                "To use npm packages with mise, you need to install Node.js first:\n\
-                  mise use node@latest\n\n\
-                Alternatively, you can use bun instead of npm by setting:\n\
-                  mise settings npm.bun=true",
-            )
-            .await
+        match Settings::get().npm.package_manager.as_str() {
+            "bun" => {
+                self.warn_if_dependency_missing(
+                    config,
+                    "bun",
+                    "To use npm packages with bun, you need to install bun first:\n\
+                      mise use bun@latest\n\n\
+                    Or switch back to npm by setting:\n\
+                      mise settings npm.package_manager=npm",
+                )
+                .await
+            }
+            "pnpm" => {
+                self.warn_if_dependency_missing(
+                    config,
+                    "pnpm",
+                    "To use npm packages with pnpm, you need to install pnpm first:\n\
+                      mise use pnpm@latest\n\n\
+                    Or switch back to npm by setting:\n\
+                      mise settings npm.package_manager=npm",
+                )
+                .await
+            }
+            _ => {
+                self.warn_if_dependency_missing(
+                    config,
+                    "npm",
+                    "To use npm packages with mise, you need to install Node.js first:\n\
+                      mise use node@latest\n\n\
+                    Alternatively, you can use bun or pnpm instead of npm by setting:\n\
+                      mise settings npm.package_manager=bun",
+                )
+                .await
+            }
         }
     }
 }

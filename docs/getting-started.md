@@ -53,19 +53,19 @@ choco install mise
 ::: code-group
 
 ```sh [amd64]
-sudo apt update -y && sudo apt install -y gpg sudo wget curl
+sudo apt update -y && sudo apt install -y curl
 sudo install -dm 755 /etc/apt/keyrings
-wget -qO - https://mise.jdx.dev/gpg-key.pub | gpg --dearmor | sudo tee /etc/apt/keyrings/mise-archive-keyring.gpg 1> /dev/null
-echo "deb [signed-by=/etc/apt/keyrings/mise-archive-keyring.gpg arch=amd64] https://mise.jdx.dev/deb stable main" | sudo tee /etc/apt/sources.list.d/mise.list
+curl -fSs https://mise.jdx.dev/gpg-key.pub | sudo tee /etc/apt/keyrings/mise-archive-keyring.pub 1> /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/mise-archive-keyring.pub arch=amd64] https://mise.jdx.dev/deb stable main" | sudo tee /etc/apt/sources.list.d/mise.list
 sudo apt update
 sudo apt install -y mise
 ```
 
 ```sh [arm64]
-sudo apt update -y && sudo apt install -y gpg sudo wget curl
+sudo apt update -y && sudo apt install -y curl
 sudo install -dm 755 /etc/apt/keyrings
-wget -qO - https://mise.jdx.dev/gpg-key.pub | gpg --dearmor | sudo tee /etc/apt/keyrings/mise-archive-keyring.gpg 1> /dev/null
-echo "deb [signed-by=/etc/apt/keyrings/mise-archive-keyring.gpg arch=arm64] https://mise.jdx.dev/deb stable main" | sudo tee /etc/apt/sources.list.d/mise.list
+curl -fSs https://mise.jdx.dev/gpg-key.pub | sudo tee /etc/apt/keyrings/mise-archive-keyring.pub 1> /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/mise-archive-keyring.pub arch=arm64] https://mise.jdx.dev/deb stable main" | sudo tee /etc/apt/sources.list.d/mise.list
 sudo apt update
 sudo apt install -y mise
 ```
@@ -107,19 +107,19 @@ mise exec python@3 -- python
 # >>> ...
 ```
 
-or run node 22:
+or run node 24:
 
 ```sh
-mise exec node@22 -- node -v
-# v22.x.x
+mise exec node@24 -- node -v
+# v24.x.x
 ```
 
 [`mise x|exec`](/cli/exec.html) is a powerful way to load the current `mise` context (tools & environment variables) without modifying your shell session or running ad-hoc commands with mise tools set. Installing [`tools`](/dev-tools/) is as simple as running [`mise u|use`](/cli/use.html).
 
 ```shell
-mise use --global node@22 # install node 22 and set it as the global default
+mise use --global node@24 # install node 24 and set it as the global default
 mise exec -- node my-script.js
-# run my-script.js with node 22...
+# run my-script.js with node 24...
 ```
 
 Another useful command is [`mise r|run`](/cli/run.html) which allows you to run a [`mise task`](/tasks/) or a script with the `mise` context.
@@ -219,16 +219,16 @@ You can run [`mise dr|doctor`](/cli/doctor.html) to verify that mise is correctl
 Now that `mise` is activated or its shims have been added to `PATH`, `node` is also available directly! (without using `mise exec`):
 
 ```sh
-mise use --global node@22
+mise use --global node@24
 node -v
-# v22.x.x
+# v24.x.x
 ```
 
-Note that when you ran `mise use --global node@22`, `mise` updated the global `mise` configuration.
+Note that when you ran `mise use --global node@24`, `mise` updated the global `mise` configuration.
 
 ```toml [~/.config/mise/config.toml]
 [tools]
-node = "22"
+node = "24"
 ```
 
 ## 4. Use tools from backends (npm, pipx, core, aqua, github) {#tool-backends}
@@ -274,11 +274,11 @@ For example, to install [claude-code](https://www.npmjs.com/package/@anthropic-a
 
 ```sh
 # run claude-code via mise x|exec
-mise exec npm:@anthropic-ai/claude-code -- claude-code --version
+mise exec npm:@anthropic-ai/claude-code -- claude --version
 
 # or if mise is activated in your shell
 mise use --global npm:@anthropic-ai/claude-code
-claude-code --version
+claude --version
 ```
 
 Install [black](https://github.com/psf/black) with the pipx backend:
@@ -305,7 +305,7 @@ ripgrep --version
 
 See [Backends](/dev-tools/backends/) for more ecosystems and details.
 
-### 5. Setting environment variables {#environment-variables}
+## 5. Setting environment variables {#environment-variables}
 
 You can set environment variables in `mise.toml` which will be set if mise is activated or if `mise x|exec` is used in a directory:
 
@@ -322,7 +322,7 @@ echo "node env: $NODE_ENV"
 # node env: production
 ```
 
-### 6. Run a task {#run-a-task}
+## 6. Run a task {#run-a-task}
 
 You can define simple tasks in `mise.toml` and run them with `mise run`:
 

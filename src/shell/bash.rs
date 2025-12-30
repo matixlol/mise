@@ -3,25 +3,37 @@
 use std::fmt::Display;
 
 use indoc::formatdoc;
+use shell_escape::unix::escape;
 
 use crate::config::Settings;
-use crate::shell::{ActivateOptions, Shell};
+use crate::shell::{self, ActivateOptions, Shell};
 
 #[derive(Default)]
 pub struct Bash {}
+
+impl Bash {}
 
 impl Shell for Bash {
     fn activate(&self, opts: ActivateOptions) -> String {
         let exe = opts.exe;
         let flags = opts.flags;
         let settings = Settings::get();
-        let exe = exe.to_string_lossy();
+
+        let exe = escape(exe.to_string_lossy());
 
         let mut out = String::new();
+
+        out.push_str(&shell::build_deactivation_script(self));
+
         out.push_str(&self.format_activate_prelude(&opts.prelude));
         out.push_str(&formatdoc! {r#"
             export MISE_SHELL=bash
-            export __MISE_ORIG_PATH="$PATH"
+
+            # On first activation, save the original PATH
+            # On re-activation, we keep the saved original
+            if [ -z "${{__MISE_ORIG_PATH:-}}" ]; then
+              export __MISE_ORIG_PATH="$PATH"
+            fi
 
             mise() {{
               local command
@@ -93,10 +105,12 @@ impl Shell for Bash {
 
     fn deactivate(&self) -> String {
         formatdoc! {r#"
-            PROMPT_COMMAND="${{PROMPT_COMMAND//_mise_hook;/}}"
-            PROMPT_COMMAND="${{PROMPT_COMMAND//_mise_hook/}}"
-            unset _mise_hook
-            unset mise
+            if [[ ${{PROMPT_COMMAND-}} == *_mise_hook* ]]; then
+                PROMPT_COMMAND="${{PROMPT_COMMAND//_mise_hook;/}}"
+                PROMPT_COMMAND="${{PROMPT_COMMAND//_mise_hook/}}"
+            fi
+            unset -f _mise_hook
+            unset -f mise
             unset MISE_SHELL
             unset __MISE_DIFF
             unset __MISE_SESSION
@@ -115,6 +129,17 @@ impl Shell for Bash {
 
     fn unset_env(&self, k: &str) -> String {
         format!("unset {k}\n", k = shell_escape::unix::escape(k.into()))
+    }
+
+    fn set_alias(&self, name: &str, cmd: &str) -> String {
+        let name = shell_escape::unix::escape(name.into());
+        let cmd = shell_escape::unix::escape(cmd.into());
+        format!("alias {name}={cmd}\n")
+    }
+
+    fn unset_alias(&self, name: &str) -> String {
+        let name = shell_escape::unix::escape(name.into());
+        format!("unalias {name} 2>/dev/null || true\n")
     }
 }
 
@@ -136,6 +161,11 @@ mod tests {
 
     #[test]
     fn test_activate() {
+        unsafe {
+            std::env::remove_var("__MISE_ORIG_PATH");
+            std::env::remove_var("__MISE_DIFF");
+        }
+
         let bash = Bash::default();
         let exe = Path::new("/some/dir/mise");
         let opts = ActivateOptions {

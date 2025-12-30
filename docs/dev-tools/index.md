@@ -22,6 +22,9 @@ It's also compatible
 with asdf `.tool-versions` files as well as [idiomatic version files](/configuration#idiomatic-version-files) like `.node-version` and
 `.ruby-version`. See [configuration](/configuration) for more details.
 
+When specifying tool versions, you can also refer to environment variables defined in the same file, but note
+that environment variables from referenced files are not resolved here.
+
 ::: info
 mise is inspired by [asdf](https://asdf-vm.com) and can leverage asdf's
 vast [plugin ecosystem](https://github.com/mise-plugins/registry)
@@ -229,22 +232,22 @@ For some users, `mise use` might be the only command you need to learn. It will 
 
 ```shell
 > cd my-project
-> mise use node@22
+> mise use node@24
 # download node, verify signature...
-mise node@22.12.0 ✓ installed
-mise ~/my-project/mise.toml tools: node@22.12.0 # mise.toml created/updated
+mise node@24.x.x ✓ installed
+mise ~/my-project/mise.toml tools: node@24.x.x # mise.toml created/updated
 
 > which node
-~/.local/share/installs/node/22.12.0/bin/node
+~/.local/share/installs/node/24.x.x/bin/node
 ```
 
-`mise use node@22` will install the latest version of node-22 and create/update the
+`mise use node@24` will install the latest version of node-24 and create/update the
 `mise.toml`
 config file in the local directory. Anytime you're in that directory, that version of `node` will be
 used.
 
-`mise use -g node@22` will do the same but update the [global config](/configuration.html#global-config-config-mise-config-toml) (~/.config/mise/config.toml) so
-unless there is a config file in the local directory hierarchy, node-22 will be the default version
+`mise use -g node@24` will do the same but update the [global config](/configuration.html#global-config-config-mise-config-toml) (~/.config/mise/config.toml) so
+unless there is a config file in the local directory hierarchy, node-24 will be the default version
 for
 the user.
 

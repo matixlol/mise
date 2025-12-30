@@ -474,6 +474,17 @@
           "type": "boolean",
           "deprecated": true
         },
+        "conda": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "default": "conda-forge",
+              "description": "Default channel for conda packages.",
+              "type": "string"
+            }
+          }
+        },
         "cd": {
           "description": "Path to change to after launching mise",
           "type": "string"
@@ -487,6 +498,12 @@
           "default": true,
           "description": "Use color in mise terminal output",
           "type": "boolean"
+        },
+        "color_theme": {
+          "default": "default",
+          "description": "Theme for interactive prompts (default/charm, base16, catppuccin, dracula)",
+          "type": "string",
+          "enum": ["default", "charm", "base16", "catppuccin", "dracula"]
         },
         "debug": {
           "description": "Sets log level to debug",
@@ -599,7 +616,7 @@
           "type": "string"
         },
         "fetch_remote_versions_timeout": {
-          "default": "10s",
+          "default": "20s",
           "description": "Timeout in seconds for HTTP requests to fetch new tool versions in mise.",
           "type": "string"
         },
@@ -615,6 +632,27 @@
         "global_config_root": {
           "description": "Path which is used as `{{config_root}}` for the global config file. Default is `$HOME`. This must be an env var.",
           "type": "string"
+        },
+        "github": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "github_attestations": {
+              "default": true,
+              "description": "Enable GitHub Artifact Attestations verification for github backend tools.",
+              "type": "boolean"
+            },
+            "slsa": {
+              "default": true,
+              "description": "Enable SLSA provenance verification for github backend tools.",
+              "type": "boolean"
+            }
+          }
+        },
+        "slsa": {
+          "default": true,
+          "description": "Enable SLSA provenance verification globally.",
+          "type": "boolean"
         },
         "go_default_packages_file": {
           "default": "~/.default-go-packages",
@@ -653,6 +691,11 @@
           "description": "Use gpg to verify all tool signatures.",
           "type": "boolean"
         },
+        "github_attestations": {
+          "default": true,
+          "description": "Enable GitHub Artifact Attestations verification for supported tools.",
+          "type": "boolean"
+        },
         "http_timeout": {
           "default": "30s",
           "description": "Timeout in seconds for all HTTP requests in mise.",
@@ -662,6 +705,22 @@
           "default": 0,
           "description": "Number of retries for HTTP requests in mise.",
           "type": "number"
+        },
+        "hook_env": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cache_ttl": {
+              "default": "0s",
+              "description": "Cache hook-env directory checks for this duration. Useful for slow filesystems like NFS.",
+              "type": "string"
+            },
+            "chpwd_only": {
+              "default": false,
+              "description": "Only run hook-env checks on directory change, not on every prompt.",
+              "type": "boolean"
+            }
+          }
         },
         "idiomatic_version_file": {
           "description": "Set to false to disable the idiomatic version files such as .node-version, .ruby-version, etc.",
@@ -693,6 +752,10 @@
             "type": "string"
           }
         },
+        "install_before": {
+          "description": "Only install versions released before this date",
+          "type": "string"
+        },
         "jobs": {
           "default": 8,
           "description": "How many jobs to run concurrently such as tool installs.",
@@ -723,11 +786,25 @@
           "description": "Create and read lockfiles for tool versions.",
           "type": "boolean"
         },
+        "locked": {
+          "default": false,
+          "description": "Require lockfile URLs to be present during installation.",
+          "type": "boolean"
+        },
         "log_level": {
           "default": "info",
           "description": "Show more/less output.",
           "type": "string",
           "enum": ["trace", "debug", "info", "warn", "error"]
+        },
+        "netrc": {
+          "default": true,
+          "description": "Use a netrc file for HTTP Basic authentication.",
+          "type": "boolean"
+        },
+        "netrc_file": {
+          "description": "Path to the netrc file to use for HTTP Basic authentication.",
+          "type": "string"
         },
         "node": {
           "type": "object",
@@ -762,7 +839,13 @@
           "properties": {
             "bun": {
               "description": "Use bun instead of npm if bun is installed and on PATH.",
-              "type": "boolean"
+              "type": "boolean",
+              "deprecated": true
+            },
+            "package_manager": {
+              "default": "npm",
+              "description": "Package manager to use for installing npm packages.",
+              "type": "string"
             }
           }
         },
@@ -955,10 +1038,31 @@
               "description": "A list of patch files or URLs to apply to ruby source.",
               "type": "string"
             },
+            "compile": {
+              "description": "[experimental] Set to true to always compile ruby from source.",
+              "type": "boolean"
+            },
             "default_packages_file": {
               "default": "~/.default-gems",
               "description": "Path to a file containing default ruby gems to install when installing ruby.",
               "type": "string"
+            },
+            "precompiled_arch": {
+              "description": "[experimental] Override architecture identifier for precompiled Ruby binaries.",
+              "type": "string"
+            },
+            "precompiled_os": {
+              "description": "[experimental] Override OS identifier for precompiled Ruby binaries.",
+              "type": "string"
+            },
+            "precompiled_url": {
+              "default": "jdx/ruby",
+              "description": "[experimental] URL template or GitHub repo for precompiled Ruby binaries.",
+              "type": "string"
+            },
+            "github_attestations": {
+              "description": "[experimental] Enable GitHub Artifact Attestations verification for precompiled Ruby binaries.",
+              "type": "boolean"
             },
             "ruby_build_opts": {
               "description": "Options to pass to ruby-build.",
@@ -966,7 +1070,7 @@
             },
             "ruby_build_repo": {
               "default": "https://github.com/rbenv/ruby-build.git",
-              "description": "URL to fetch ruby-build from.",
+              "description": "The URL used to fetch ruby-build. This accepts either a Git repository or a ZIP archive.",
               "type": "string"
             },
             "ruby_install": {
@@ -979,7 +1083,7 @@
             },
             "ruby_install_repo": {
               "default": "https://github.com/postmodern/ruby-install.git",
-              "description": "URL to fetch ruby-install from.",
+              "description": "The URL used to fetch ruby-install. This accepts either a Git repository or a ZIP archive.",
               "type": "string"
             },
             "verbose_install": {
@@ -1031,6 +1135,11 @@
               "items": {
                 "type": "string"
               }
+            },
+            "strict": {
+              "default": true,
+              "description": "If true, fail when age decryption fails (including when age is not available, the key is missing, or the key is invalid). If false, skip decryption and continue in these cases.",
+              "type": "boolean"
             }
           }
         },
@@ -1077,6 +1186,11 @@
             },
             "show_tools": {
               "description": "Show configured tools when entering a directory with a mise.toml file.",
+              "type": "boolean"
+            },
+            "show_prepare_stale": {
+              "default": true,
+              "description": "Show warning when prepare providers have stale dependencies.",
               "type": "boolean"
             },
             "truncate": {
@@ -1142,6 +1256,10 @@
             "type": "string"
           }
         },
+        "task_skip_depends": {
+          "description": "Run only specified tasks skipping all dependencies.",
+          "type": "boolean"
+        },
         "task_timeout": {
           "description": "Default timeout for tasks. Can be overridden by individual tasks.",
           "type": "string"
@@ -1164,12 +1282,12 @@
         },
         "unix_default_file_shell_args": {
           "default": "sh",
-          "description": "List of default shell arguments for unix to be used with `file`. For example `sh`.",
+          "description": "Default shell arguments for Unix to be used for file commands. For example, `sh` for sh.",
           "type": "string"
         },
         "unix_default_inline_shell_args": {
           "default": "sh -c -o errexit",
-          "description": "List of default shell arguments for unix to be used with inline commands. For example, `sh`, `-c` for sh.",
+          "description": "Default shell arguments for Unix to be used for inline commands. For example, `sh -c` for sh.",
           "type": "string"
         },
         "url_replacements": {
@@ -1189,6 +1307,11 @@
           "description": "Set to false to disable using the mise-versions API as a quick way for mise to query for new versions.",
           "type": "boolean"
         },
+        "use_versions_host_track": {
+          "default": true,
+          "description": "Send anonymous download statistics when installing tools.",
+          "type": "boolean"
+        },
         "verbose": {
           "description": "Shows more verbose output such as installation logs when installing tools.",
           "type": "boolean"
@@ -1200,15 +1323,12 @@
         },
         "windows_default_file_shell_args": {
           "default": "cmd /c",
-          "description": "List of default shell arguments for Windows to be used for file commands. For example, `cmd`, `/c` for cmd.exe.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
+          "description": "Default shell arguments for Windows to be used for file commands. For example, `cmd /c` for cmd.exe.",
+          "type": "string"
         },
         "windows_default_inline_shell_args": {
           "default": "cmd /c",
-          "description": "List of default shell arguments for Windows to be used for inline commands. For example, `cmd`, `/c` for cmd.exe.",
+          "description": "Default shell arguments for Windows to be used for inline commands. For example, `cmd /c` for cmd.exe.",
           "type": "string"
         },
         "windows_executable_extensions": {
@@ -1227,6 +1347,17 @@
         "yes": {
           "description": "This will automatically answer yes or no to prompts. This is useful for scripting.",
           "type": "boolean"
+        },
+        "zig": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "use_community_mirrors": {
+              "default": true,
+              "description": "Download Zig from community-maintained mirrors",
+              "type": "boolean"
+            }
+          }
         },
         "task": {
           "type": "object",
@@ -1782,12 +1913,72 @@
           }
         }
       }
+    },
+    "prepare_provider": {
+      "type": "object",
+      "properties": {
+        "auto": {
+          "type": "boolean",
+          "default": false,
+          "description": "Auto-run before `mise x` and `mise run`"
+        },
+        "sources": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "Files/patterns to check for changes"
+        },
+        "outputs": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "Files/directories that should be newer than sources"
+        },
+        "run": {
+          "type": "string",
+          "description": "Command to run when stale"
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment variables to set"
+        },
+        "dir": {
+          "type": "string",
+          "description": "Working directory for the command"
+        },
+        "description": {
+          "type": "string",
+          "description": "Description shown in output"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Prepare provider configuration"
     }
   },
   "additionalProperties": false,
   "description": "config file for mise version manager (mise.toml)",
   "properties": {
     "alias": {
+      "deprecated": true,
       "description": "custom shorthands",
       "type": "object",
       "additionalProperties": {
@@ -1805,6 +1996,34 @@
             }
           }
         ]
+      }
+    },
+    "tool_alias": {
+      "description": "Tool version aliases",
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "description": "where the alias goes",
+            "type": "string"
+          },
+          {
+            "description": "tool to set aliases for",
+            "type": "object",
+            "additionalProperties": {
+              "description": "version alias points to",
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "shell_alias": {
+      "description": "shell aliases",
+      "type": "object",
+      "additionalProperties": {
+        "description": "command to run",
+        "type": "string"
       }
     },
     "env": {
@@ -1862,6 +2081,52 @@
       },
       "description": "plugins to use",
       "type": "object"
+    },
+    "prepare": {
+      "type": "object",
+      "properties": {
+        "disable": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Disable specific prepare providers"
+        },
+        "npm": {
+          "$ref": "#/$defs/prepare_provider"
+        },
+        "yarn": {
+          "$ref": "#/$defs/prepare_provider"
+        },
+        "pnpm": {
+          "$ref": "#/$defs/prepare_provider"
+        },
+        "bun": {
+          "$ref": "#/$defs/prepare_provider"
+        },
+        "go": {
+          "$ref": "#/$defs/prepare_provider"
+        },
+        "pip": {
+          "$ref": "#/$defs/prepare_provider"
+        },
+        "poetry": {
+          "$ref": "#/$defs/prepare_provider"
+        },
+        "uv": {
+          "$ref": "#/$defs/prepare_provider"
+        },
+        "bundler": {
+          "$ref": "#/$defs/prepare_provider"
+        },
+        "composer": {
+          "$ref": "#/$defs/prepare_provider"
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/prepare_provider"
+      },
+      "description": "configure prepare providers"
     },
     "settings": {
       "$ref": "#/$defs/settings",

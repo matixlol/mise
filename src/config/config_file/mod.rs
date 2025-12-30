@@ -17,6 +17,7 @@ use crate::errors::Error::UntrustedConfig;
 use crate::file::display_path;
 use crate::hash::hash_to_str;
 use crate::hooks::Hook;
+use crate::prepare::PrepareConfig;
 use crate::redactions::Redactions;
 use crate::task::Task;
 use crate::toolset::{ToolRequest, ToolRequestSet, ToolSource, ToolVersionList, Toolset};
@@ -25,6 +26,7 @@ use crate::watch_files::WatchFile;
 use crate::{backend, config, dirs, env, file, hash};
 use eyre::{Result, eyre};
 use idiomatic_version::IdiomaticVersionFile;
+use indexmap::IndexMap;
 use serde_derive::Deserialize;
 use std::sync::LazyLock as Lazy;
 use tool_versions::ToolVersions;
@@ -98,6 +100,10 @@ pub trait ConfigFile: Debug + Send + Sync {
         Ok(Default::default())
     }
 
+    fn shell_aliases(&self) -> eyre::Result<IndexMap<String, String>> {
+        Ok(Default::default())
+    }
+
     fn task_config(&self) -> &TaskConfig {
         static DEFAULT_TASK_CONFIG: Lazy<TaskConfig> = Lazy::new(TaskConfig::default);
         &DEFAULT_TASK_CONFIG
@@ -118,6 +124,10 @@ pub trait ConfigFile: Debug + Send + Sync {
 
     fn hooks(&self) -> Result<Vec<Hook>> {
         Ok(Default::default())
+    }
+
+    fn prepare_config(&self) -> Option<PrepareConfig> {
+        None
     }
 }
 
@@ -246,10 +256,10 @@ pub async fn parse_or_init(path: &Path) -> eyre::Result<Arc<dyn ConfigFile>> {
 }
 
 pub async fn parse(path: &Path) -> Result<Arc<dyn ConfigFile>> {
-    if let Ok(settings) = Settings::try_get() {
-        if settings.paranoid {
-            trust_check(path)?;
-        }
+    if let Ok(settings) = Settings::try_get()
+        && settings.paranoid
+    {
+        trust_check(path)?;
     }
     match detect_config_file_type(path).await {
         Some(ConfigFileType::MiseToml) => Ok(Arc::new(MiseToml::from_file(path)?)),
@@ -328,17 +338,17 @@ pub fn is_trusted(path: &Path) -> bool {
 
     // Check if this path is within a trusted monorepo root
     // Monorepo roots are marked with a special marker file when trusted
-    if settings.experimental {
-        if let Some(parent) = canonicalized_path.parent() {
-            let mut current = parent;
-            while let Some(dir) = current.parent() {
-                let monorepo_marker = trust_path(dir).with_extension("monorepo");
-                if monorepo_marker.exists() {
-                    add_trusted(canonicalized_path.to_path_buf());
-                    return true;
-                }
-                current = dir;
+    if settings.experimental
+        && let Some(parent) = canonicalized_path.parent()
+    {
+        let mut current = parent;
+        while let Some(dir) = current.parent() {
+            let monorepo_marker = trust_path(dir).with_extension("monorepo");
+            if monorepo_marker.exists() {
+                add_trusted(canonicalized_path.to_path_buf());
+                return true;
             }
+            current = dir;
         }
     }
     if settings.paranoid {

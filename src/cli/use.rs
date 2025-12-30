@@ -6,11 +6,13 @@ use std::{
 use console::{Term, style};
 use eyre::{Result, bail, eyre};
 use itertools::Itertools;
+use jiff::Timestamp;
 use path_absolutize::Absolutize;
 
 use crate::cli::args::{BackendArg, ToolArg};
 use crate::config::config_file::ConfigFile;
 use crate::config::{Config, ConfigPathOptions, Settings, config_file, resolve_target_config_path};
+use crate::duration::parse_into_timestamp;
 use crate::file::display_path;
 use crate::registry::REGISTRY;
 use crate::toolset::{
@@ -47,42 +49,26 @@ pub struct Use {
     #[clap(value_name = "TOOL@VERSION", verbatim_doc_comment)]
     tool: Vec<ToolArg>,
 
+    /// Create/modify an environment-specific config file like .mise.<env>.toml
+    #[clap(long, short, overrides_with_all = & ["global", "path"])]
+    env: Option<String>,
+
     /// Force reinstall even if already installed
     #[clap(long, short, requires = "tool")]
     force: bool,
 
-    /// Save fuzzy version to config file
-    ///
-    /// e.g.: `mise use --fuzzy node@20` will save 20 as the version
-    /// this is the default behavior unless `MISE_PIN=1`
-    #[clap(long, verbatim_doc_comment, overrides_with = "pin")]
-    fuzzy: bool,
-
     /// Use the global config file (`~/.config/mise/config.toml`) instead of the local one
     #[clap(short, long, overrides_with_all = & ["path", "env"])]
     global: bool,
-
-    /// Perform a dry run, showing what would be installed and modified without making changes
-    #[clap(long, short = 'n', verbatim_doc_comment)]
-    dry_run: bool,
-
-    /// Create/modify an environment-specific config file like .mise.<env>.toml
-    #[clap(long, short, overrides_with_all = & ["global", "path"])]
-    env: Option<String>,
 
     /// Number of jobs to run in parallel
     /// [default: 4]
     #[clap(long, short, env = "MISE_JOBS", verbatim_doc_comment)]
     jobs: Option<usize>,
 
-    /// Directly pipe stdin/stdout/stderr from plugin to user
-    /// Sets `--jobs=1`
-    #[clap(long, overrides_with = "jobs")]
-    raw: bool,
-
-    /// Remove the plugin(s) from config file
-    #[clap(long, value_name = "PLUGIN", aliases = ["rm", "unset"])]
-    remove: Vec<BackendArg>,
+    /// Perform a dry run, showing what would be installed and modified without making changes
+    #[clap(long, short = 'n', verbatim_doc_comment)]
+    dry_run: bool,
 
     /// Specify a path to a config file or directory
     ///
@@ -90,6 +76,19 @@ pub struct Use {
     /// the rules above.
     #[clap(short, long, overrides_with_all = & ["global", "env"], value_hint = clap::ValueHint::FilePath)]
     path: Option<PathBuf>,
+
+    /// Only install versions released before this date
+    ///
+    /// Supports absolute dates like "2024-06-01" and relative durations like "90d" or "1y".
+    #[clap(long, verbatim_doc_comment)]
+    before: Option<String>,
+
+    /// Save fuzzy version to config file
+    ///
+    /// e.g.: `mise use --fuzzy node@20` will save 20 as the version
+    /// this is the default behavior unless `MISE_PIN=1`
+    #[clap(long, verbatim_doc_comment, overrides_with = "pin")]
+    fuzzy: bool,
 
     /// Save exact version to config file
     /// e.g.: `mise use --pin node@20` will save 20.0.0 as the version
@@ -99,6 +98,15 @@ pub struct Use {
     /// https://mise.jdx.dev/configuration/settings.html#lockfile
     #[clap(long, verbatim_doc_comment, overrides_with = "fuzzy")]
     pin: bool,
+
+    /// Directly pipe stdin/stdout/stderr from plugin to user
+    /// Sets `--jobs=1`
+    #[clap(long, overrides_with = "jobs")]
+    raw: bool,
+
+    /// Remove the plugin(s) from config file
+    #[clap(long, value_name = "PLUGIN", aliases = ["rm", "unset"])]
+    remove: Vec<BackendArg>,
 }
 
 impl Use {
@@ -116,6 +124,7 @@ impl Use {
         let mut resolve_options = ResolveOptions {
             latest_versions: false,
             use_locked_version: true,
+            before_date: self.get_before_date()?,
         };
         let versions: Vec<_> = self
             .tool
@@ -161,21 +170,20 @@ impl Use {
                 .into_iter()
                 .map(|tv| {
                     let mut request = tv.request.clone();
-                    if pin {
-                        if let ToolRequest::Version {
+                    if pin
+                        && let ToolRequest::Version {
                             version: _version,
                             source,
                             options,
                             backend,
                         } = request
-                        {
-                            request = ToolRequest::Version {
-                                version: tv.version.clone(),
-                                source,
-                                options,
-                                backend,
-                            };
-                        }
+                    {
+                        request = ToolRequest::Version {
+                            version: tv.version.clone(),
+                            source,
+                            options,
+                            backend,
+                        };
                     }
                     request
                 })
@@ -244,12 +252,11 @@ impl Use {
             warn!("{plugin} is defined in {p} which overrides the global config ({global})");
         };
         for targ in &self.tool {
-            if let Some(tv) = ts.versions.get(targ.ba.as_ref()) {
-                if let ToolSource::MiseToml(p) | ToolSource::ToolVersions(p) = &tv.source {
-                    if !file::same_file(p, global) {
-                        warn(targ, p);
-                    }
-                }
+            if let Some(tv) = ts.versions.get(targ.ba.as_ref())
+                && let ToolSource::MiseToml(p) | ToolSource::ToolVersions(p) = &tv.source
+                && !file::same_file(p, global)
+            {
+                warn(targ, p);
             }
         }
     }
@@ -308,10 +315,12 @@ impl Use {
         if !console::user_attended_stderr() {
             bail!("No tool specified and not running interactively");
         }
+        let theme = crate::ui::theme::get_theme();
         let mut s = demand::Select::new("Tools")
             .description("Select a tool to install")
             .filtering(true)
-            .filterable(true);
+            .filterable(true)
+            .theme(&theme);
         for rt in REGISTRY.values().unique_by(|r| r.short) {
             if let Some(backend) = rt.backends().first() {
                 // TODO: populate registry with descriptions from aqua and other sources
@@ -328,6 +337,17 @@ impl Use {
                 Err(eyre!(err))
             }
         }
+    }
+
+    /// Get the before_date from CLI flag or settings
+    fn get_before_date(&self) -> Result<Option<Timestamp>> {
+        if let Some(before) = &self.before {
+            return Ok(Some(parse_into_timestamp(before)?));
+        }
+        if let Some(before) = &Settings::get().install_before {
+            return Ok(Some(parse_into_timestamp(before)?));
+        }
+        Ok(None)
     }
 }
 

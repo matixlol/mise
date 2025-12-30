@@ -1,10 +1,11 @@
 use crate::file::{display_path, remove_all};
 use crate::git::{CloneOptions, Git};
-use crate::plugins::Plugin;
+use crate::http::HTTP;
+use crate::plugins::{Plugin, PluginSource};
 use crate::result::Result;
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
-use crate::{config::Config, dirs, registry};
+use crate::{config::Config, dirs, file, registry};
 use async_trait::async_trait;
 use console::style;
 use contracts::requires;
@@ -14,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use url::Url;
 use vfox::Vfox;
+use vfox::embedded_plugins;
 use xx::regex;
 
 #[derive(Debug)]
@@ -42,11 +44,21 @@ impl VfoxPlugin {
         self.repo.lock().unwrap()
     }
 
-    fn get_repo_url(&self) -> eyre::Result<Url> {
+    fn get_repo_url(&self, config: &Config) -> eyre::Result<Url> {
         if let Some(url) = self.repo().get_remote_url() {
             return Ok(Url::parse(&url)?);
         }
-        vfox_to_url(self.full.as_ref().unwrap_or(&self.name))
+        if let Some(url) = config.get_repo_url(&self.name) {
+            return Ok(Url::parse(&url)?);
+        }
+        let url = self
+            .full
+            .as_ref()
+            .unwrap_or(&self.name)
+            .split_once(':')
+            .map(|f| f.1)
+            .unwrap_or(&self.name);
+        vfox_to_url(url)
     }
 
     pub async fn mise_env(&self, opts: &toml::Value) -> Result<Option<IndexMap<String, String>>> {
@@ -78,6 +90,29 @@ impl VfoxPlugin {
         let rx = vfox.log_subscribe();
         (vfox, rx)
     }
+
+    async fn install_from_zip(&self, url: &str, pr: &dyn SingleReport) -> eyre::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_archive = temp_dir.path().join("archive.zip");
+        HTTP.download_file(url, &temp_archive, Some(pr)).await?;
+
+        pr.set_message("extracting zip file".to_string());
+
+        let strip_components = file::should_strip_components(&temp_archive, file::TarFormat::Zip)?;
+
+        file::unzip(
+            &temp_archive,
+            &self.plugin_path,
+            &file::ZipOptions {
+                strip_components: if strip_components { 1 } else { 0 },
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn is_embedded(&self) -> bool {
+        embedded_plugins::get_embedded_plugin(&self.name).is_some()
+    }
 }
 
 #[async_trait]
@@ -100,21 +135,24 @@ impl Plugin for VfoxPlugin {
     }
 
     fn current_abbrev_ref(&self) -> eyre::Result<Option<String>> {
-        if !self.is_installed() {
+        // No git ref for embedded plugins or if plugin_path doesn't exist
+        if !self.plugin_path.exists() {
             return Ok(None);
         }
         self.repo().current_abbrev_ref().map(Some)
     }
 
     fn current_sha_short(&self) -> eyre::Result<Option<String>> {
-        if !self.is_installed() {
+        // No git sha for embedded plugins or if plugin_path doesn't exist
+        if !self.plugin_path.exists() {
             return Ok(None);
         }
         self.repo().current_sha_short().map(Some)
     }
 
     fn is_installed(&self) -> bool {
-        self.plugin_path.exists()
+        // Embedded plugins are always "installed"
+        self.is_embedded() || self.plugin_path.exists()
     }
 
     fn is_installed_err(&self) -> eyre::Result<()> {
@@ -127,13 +165,18 @@ impl Plugin for VfoxPlugin {
 
     async fn ensure_installed(
         &self,
-        _config: &Arc<Config>,
+        config: &Arc<Config>,
         mpr: &MultiProgressReport,
         _force: bool,
         dry_run: bool,
     ) -> Result<()> {
+        // Skip installation for embedded plugins
+        if self.is_embedded() {
+            return Ok(());
+        }
+
         if !self.plugin_path.exists() {
-            let url = self.get_repo_url()?;
+            let url = self.get_repo_url(config)?;
             trace!("Cloning vfox plugin: {url}");
             let pr = mpr.add_with_options(&format!("clone vfox plugin {url}"), dry_run);
             if !dry_run {
@@ -145,6 +188,16 @@ impl Plugin for VfoxPlugin {
     }
 
     async fn update(&self, pr: &dyn SingleReport, gitref: Option<String>) -> Result<()> {
+        // If only embedded (no filesystem plugin), warn that it can't be updated
+        if self.is_embedded() && !self.plugin_path.exists() {
+            warn!(
+                "plugin:{} is embedded in mise, not updating",
+                style(&self.name).blue().for_stderr()
+            );
+            pr.finish_with_message("embedded plugin".into());
+            return Ok(());
+        }
+
         let plugin_path = self.plugin_path.to_path_buf();
         if plugin_path.is_symlink() {
             warn!(
@@ -176,6 +229,15 @@ impl Plugin for VfoxPlugin {
         if !self.is_installed() {
             return Ok(());
         }
+        // If only embedded (no filesystem plugin), warn that it can't be uninstalled
+        if self.is_embedded() && !self.plugin_path.exists() {
+            warn!(
+                "plugin:{} is embedded in mise, cannot uninstall",
+                style(&self.name).blue().for_stderr()
+            );
+            pr.finish_with_message("embedded plugin".into());
+            return Ok(());
+        }
         pr.set_message("uninstall".into());
 
         let rmdir = |dir: &Path| {
@@ -196,36 +258,48 @@ impl Plugin for VfoxPlugin {
         Ok(())
     }
 
-    async fn install(&self, _config: &Arc<Config>, pr: &dyn SingleReport) -> eyre::Result<()> {
-        let repository = self.get_repo_url()?;
-        let (repo_url, repo_ref) = Git::split_url_and_ref(repository.as_str());
+    async fn install(&self, config: &Arc<Config>, pr: &dyn SingleReport) -> eyre::Result<()> {
+        let repository = self.get_repo_url(config)?;
+        let source = PluginSource::parse(repository.as_str());
         debug!("vfox_plugin[{}]:install {:?}", self.name, repository);
 
         if self.is_installed() {
             self.uninstall(pr).await?;
         }
 
-        if regex!(r"^[/~]").is_match(&repo_url) {
-            Err(eyre!(
-                r#"Invalid repository URL: {repo_url}
+        match source {
+            PluginSource::Zip { url } => {
+                self.install_from_zip(&url, pr).await?;
+                pr.finish_with_message(url.to_string());
+                Ok(())
+            }
+            PluginSource::Git {
+                url: repo_url,
+                git_ref,
+            } => {
+                if regex!(r"^[/~]").is_match(&repo_url) {
+                    Err(eyre!(
+                        r#"Invalid repository URL: {repo_url}
 If you are trying to link to a local directory, use `mise plugins link` instead.
 Plugins could support local directories in the future but for now a symlink is required which `mise plugins link` will create for you."#
-            ))?;
-        }
-        let git = Git::new(&self.plugin_path);
-        pr.set_message(format!("clone {repo_url}"));
-        git.clone(&repo_url, CloneOptions::default().pr(pr))?;
-        if let Some(ref_) = &repo_ref {
-            pr.set_message(format!("git update {ref_}"));
-            git.update(Some(ref_.to_string()))?;
-        }
+                    ))?;
+                }
+                let git = Git::new(&self.plugin_path);
+                pr.set_message(format!("clone {repo_url}"));
+                git.clone(&repo_url, CloneOptions::default().pr(pr))?;
+                if let Some(ref_) = &git_ref {
+                    pr.set_message(format!("git update {ref_}"));
+                    git.update(Some(ref_.to_string()))?;
+                }
 
-        let sha = git.current_sha_short()?;
-        pr.finish_with_message(format!(
-            "{repo_url}#{}",
-            style(&sha).bright().yellow().for_stderr(),
-        ));
-        Ok(())
+                let sha = git.current_sha_short()?;
+                pr.finish_with_message(format!(
+                    "{repo_url}#{}",
+                    style(&sha).bright().yellow().for_stderr(),
+                ));
+                Ok(())
+            }
+        }
     }
 }
 

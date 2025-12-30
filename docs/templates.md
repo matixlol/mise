@@ -20,8 +20,12 @@ Here is an example of a `mise.toml` file that uses templates:
 ```toml
 [env]
 PROJECT_NAME = "{{ cwd | basename }}"
+TERRAFORM_VERSION = "1.0.0"
 
 [tools]
+# refers to env variable defined in this file
+terraform = "{{ env.TERRAFORM_VERSION }}"
+# refers to external env variable
 node = "{{ get_env(name='NODE_VERSION', default='20') }}"
 ```
 
@@ -115,7 +119,7 @@ You can also uses [tests](https://keats.github.io/tera/docs/#tests) to examine v
 
 ## Mise Template Features
 
-Mise provides additional variables, functions, filters and tests on top of tera features.
+Mise provides additional variables, functions, filters, and tests on top of tera features.
 
 ### Variables
 
@@ -128,13 +132,45 @@ These variables offer key information about the current environment:
 - `config_root: PathBuf` – Locates the directory containing your `mise.toml` file, or in the case of something like `~/src/myproj/.config/mise.toml`, it will point to `~/src/myproj`.
 - `mise_bin: String` - Points to the path to the current mise executable
 - `mise_pid: String` - Points to the pid of the current mise process
-- `mise_env: String` - The configuration environment as specified by `MISE_ENV`, `-E`, or `--env`. Will be undefined if the configuration environment is not set.
+- `mise_env: Vec<String>` - The configuration environment as specified by `MISE_ENV`, `-E`, or `--env`. Will be undefined if the configuration environment is not set.
 - `xdg_cache_home: PathBuf` - Points to the directory of XDG cache home
 - `xdg_config_home: PathBuf` - Points to the directory of XDG config home
 - `xdg_data_home: PathBuf` - Points to the directory of XDG data home
 - `xdg_state_home: PathBuf` - Points to the directory of XDG state home
 
+In **task run scripts**, mise also exposes a `usage` map when the task has a usage
+specification (see [Task Arguments](/tasks/task-arguments#usage-field)):
+
+- `usage: HashMap<String, Value>` – Parsed task arguments and flags, keyed by their
+  names. Values are **not shell-escaped or quoted** and may be:
+  - booleans (for flags and boolean args)
+  - strings
+  - arrays of booleans/strings for variadic args/flags
+
+The keys are the argument/flag names as written in the usage spec. If the name
+contains `-`, use bracket access, e.g. <span v-pre>`{{ usage["dry-run"] }}`</span>.
+Examples:
+
+```mise-toml
+[tasks.deploy]
+usage = '''
+arg "<environment>" help="Target environment"
+flag "-v --verbose" help="Enable verbose output"
+arg "[tags]" var=#true
+'''
+run = '''
+echo "env={{ usage.environment }}"
+echo "verbose={{ usage.verbose }}"
+echo "tag count={{ usage.tags | length }}"
+{% for tag in usage.tags %}
+  echo "tag={{ tag }}"
+{% endfor %}
+'''
+```
+
 ### Functions
+
+#### Tera Built-In Functions
 
 Tera offers many [built-in functions](https://keats.github.io/tera/docs/#built-in-functions).
 `[]` indicates an optional function argument.
@@ -164,10 +200,18 @@ Some functions:
 
 Tera offers more functions. Read more on [tera documentation](https://keats.github.io/tera/docs/#functions).
 
-Mise offers additional functions:
+#### Additional Mise Functions
+
+Mise offers a slew of useful functions in addition to tera's built-ins.
+
+##### General Functions
+
+These functions are available in all tasks, and will always behave the same way regardless
+of the task definition they are used in. In other words, their return values are consistent
+across task definition(s).
 
 - `exec(command) -> String` – Runs a shell command and returns its output as a string.
-- `arch() -> String` – Retrieves the system architecture, such as `x86_64` or `arm64`.
+- `arch() -> String` – Retrieves the system architecture, such as `x64` or `arm64`.
 - `os() -> String` – Returns the name of the operating system,
   e.g. linux, macos, windows.
 - `os_family() -> String` – Returns the operating system family, e.g. `unix`, `windows`.
@@ -178,7 +222,22 @@ Mise offers additional functions:
 - `read_file(path) -> String` – Reads the contents of a file at the given path and returns
   it as a string.
 
-Examples of functions:
+##### Task-Specific Functions
+
+These functions are task-specific and behave differently depending on the task they are used
+in. In other words, their return values **_may_** (but are not guaranteed to) be consistent
+across executions of any given _task_, and should be expected to be inconsisent across
+different task definition(s).
+
+For example, `task_source_files()` returns a different set of filepaths depending on the [`sources`](https://mise.jdx.dev/tasks/task-configuration.html#sources) of the task it's called from.
+
+- <span id="task-source-files">`task_source_files() -> Vec<String>`</span> – Returns the task's [`sources`](https://mise.jdx.dev/tasks/task-configuration.html#sources)
+  as an array of resolved file paths. This function processes glob patterns and Tera template strings
+  defined in the task's sources, expanding them into actual file paths. If a pattern doesn't match any
+  files, it will be omitted from the result. Returns an empty array if no sources are configured or if
+  no files match the patterns.
+
+#### Examples
 
 ```toml
 # Using exec to get command output
@@ -188,6 +247,15 @@ current = "{{ exec(command='node --version') }}"
 # Using read_file to include content from a file
 [env]
 VERSION = "{{ read_file(path='VERSION') | trim }}"
+
+# Access resolved source files in task scripts
+[tasks.example]
+sources = ["src/**/*.ts", "package.json"]
+run = '''
+{% for file in task_source_files() %}
+  echo "Processing: {{ file }}"
+{% endfor %}
+'''
 ```
 
 ### Exec Options
@@ -257,6 +325,8 @@ Tera offers more filters. Read more on [tera documentation](https://keats.github
 
 #### Path Manipulation
 
+- `path | absolute -> String` – Converts the input path into
+  an absolute path. Does not require the path to exist.
 - `path | canonicalize -> String` – Converts the input path into
   absolute input path version. Throws if path doesn't exist.
 - `path | basename -> String` – Extracts the file name from a path,

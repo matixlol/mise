@@ -8,18 +8,23 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 
+use jiff::Timestamp;
+
 use crate::cli::args::{BackendArg, ToolVersionType};
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings};
 use crate::file::{display_path, remove_all, remove_all_with_warning};
 use crate::install_context::InstallContext;
 use crate::lockfile::PlatformInfo;
+use crate::platform::Platform;
 use crate::plugins::core::CORE_PLUGINS;
 use crate::plugins::{PluginType, VERSION_REGEX};
-use crate::registry::{REGISTRY, tool_enabled};
+use crate::registry::{REGISTRY, full_to_url, normalize_remote, tool_enabled};
 use crate::runtime_symlinks::is_runtime_symlink;
 use crate::toolset::outdated_info::OutdatedInfo;
-use crate::toolset::{ToolRequest, ToolVersion, Toolset, install_state, is_outdated_version};
+use crate::toolset::{
+    ResolveOptions, ToolRequest, ToolVersion, Toolset, install_state, is_outdated_version,
+};
 use crate::ui::progress_report::SingleReport;
 use crate::{
     cache::{CacheManager, CacheManagerBuilder},
@@ -38,27 +43,30 @@ use std::sync::LazyLock as Lazy;
 
 pub mod aqua;
 pub mod asdf;
-pub mod asset_detector;
+pub mod asset_matcher;
 pub mod backend_type;
 pub mod cargo;
+pub mod conda;
 pub mod dotnet;
 mod external_plugin_cache;
 pub mod gem;
 pub mod github;
 pub mod go;
 pub mod http;
+pub mod jq;
 pub mod npm;
 pub mod pipx;
 pub mod platform_target;
 pub mod spm;
 pub mod static_helpers;
 pub mod ubi;
+pub mod version_list;
 pub mod vfox;
 
 pub type ABackend = Arc<dyn Backend>;
 pub type BackendMap = BTreeMap<String, ABackend>;
 pub type BackendList = Vec<ABackend>;
-pub type VersionCacheManager = CacheManager<Vec<String>>;
+pub type VersionCacheManager = CacheManager<Vec<VersionInfo>>;
 
 /// Information about a GitHub/GitLab release for platform-specific tools
 #[derive(Debug, Clone)]
@@ -73,6 +81,70 @@ pub struct GitHubReleaseInfo {
 pub enum ReleaseType {
     GitHub,
     GitLab,
+}
+
+/// Information about a tool version including optional metadata like creation time
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct VersionInfo {
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub created_at: Option<String>,
+    /// URL to the release page (e.g., GitHub/GitLab release page)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub release_url: Option<String>,
+}
+
+impl VersionInfo {
+    /// Filter versions to only include those released before the given timestamp.
+    /// Versions without a created_at timestamp are included by default.
+    pub fn filter_by_date(versions: Vec<Self>, before: Timestamp) -> Vec<Self> {
+        use crate::duration::parse_into_timestamp;
+        versions
+            .into_iter()
+            .filter(|v| {
+                match &v.created_at {
+                    Some(ts) => {
+                        // Parse the timestamp using parse_into_timestamp which handles
+                        // RFC3339, date-only (YYYY-MM-DD), and other formats
+                        match parse_into_timestamp(ts) {
+                            Ok(created) => created < before,
+                            Err(_) => {
+                                // If we can't parse the timestamp, include the version
+                                trace!("Failed to parse timestamp: {}", ts);
+                                true
+                            }
+                        }
+                    }
+                    // Include versions without timestamps
+                    None => true,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Security feature information for a tool
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SecurityFeature {
+    Checksum {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        algorithm: Option<String>,
+    },
+    GithubAttestations {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signer_workflow: Option<String>,
+    },
+    Slsa {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        level: Option<u8>,
+    },
+    Cosign,
+    Minisign {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        public_key: Option<String>,
+    },
+    Gpg,
 }
 
 static TOOLS: Mutex<Option<Arc<BackendMap>>> = Mutex::new(None);
@@ -172,6 +244,7 @@ pub fn arg_to_backend(ba: BackendArg) -> Option<ABackend> {
         BackendType::Aqua => Some(Arc::new(aqua::AquaBackend::from_arg(ba))),
         BackendType::Asdf => Some(Arc::new(asdf::AsdfBackend::from_arg(ba))),
         BackendType::Cargo => Some(Arc::new(cargo::CargoBackend::from_arg(ba))),
+        BackendType::Conda => Some(Arc::new(conda::CondaBackend::from_arg(ba))),
         BackendType::Dotnet => Some(Arc::new(dotnet::DotnetBackend::from_arg(ba))),
         BackendType::Npm => Some(Arc::new(npm::NPMBackend::from_arg(ba))),
         BackendType::Gem => Some(Arc::new(gem::GemBackend::from_arg(ba))),
@@ -188,6 +261,21 @@ pub fn arg_to_backend(ba: BackendArg) -> Option<ABackend> {
             Some(plugin_name.to_string()),
         ))),
         BackendType::Unknown => None,
+    }
+}
+
+/// Returns install-time-only option keys for a backend type.
+/// These are options that only affect installation/download, not post-install behavior.
+/// Used to filter cached options when config provides its own options.
+pub fn install_time_option_keys_for_type(backend_type: &BackendType) -> Vec<String> {
+    match backend_type {
+        BackendType::Http => http::install_time_option_keys(),
+        BackendType::Github | BackendType::Gitlab => github::install_time_option_keys(),
+        BackendType::Ubi => ubi::install_time_option_keys(),
+        BackendType::Cargo => cargo::install_time_option_keys(),
+        BackendType::Go => go::install_time_option_keys(),
+        BackendType::Pipx => pipx::install_time_option_keys(),
+        _ => vec![],
     }
 }
 
@@ -213,8 +301,44 @@ pub trait Backend: Debug + Send + Sync {
         format!("{os}-{arch}")
     }
 
+    /// Resolves the lockfile options for a tool request on a target platform.
+    /// These options affect artifact identity and must match exactly for lockfile lookup.
+    ///
+    /// For the current platform: resolves from Settings and ToolRequest options
+    /// For other platforms (cross-platform mise lock): uses sensible defaults
+    ///
+    /// Backends should override this to return options that affect which artifact is downloaded.
+    fn resolve_lockfile_options(
+        &self,
+        _request: &ToolRequest,
+        _target: &PlatformTarget,
+    ) -> BTreeMap<String, String> {
+        BTreeMap::new() // Default: no options affect artifact identity
+    }
+
+    /// Returns all platform variants that should be locked for a given base platform.
+    ///
+    /// Some tools have compile-time variants (e.g., bun has baseline/musl variants)
+    /// that result in different download URLs and checksums. This method allows
+    /// backends to declare all variants so `mise lock` can fetch checksums for each.
+    ///
+    /// Default returns just the base platform. Backends should override this to
+    /// return additional variants when applicable.
+    ///
+    /// Example: For bun on linux-x64, this might return:
+    /// - linux-x64 (default, AVX2)
+    /// - linux-x64-baseline (no AVX2)
+    /// - linux-x64-musl (musl libc)
+    /// - linux-x64-musl-baseline (musl + no AVX2)
+    fn platform_variants(&self, platform: &Platform) -> Vec<Platform> {
+        vec![platform.clone()] // Default: just the base platform
+    }
+
     async fn description(&self) -> Option<String> {
         None
+    }
+    async fn security_info(&self) -> Vec<SecurityFeature> {
+        vec![]
     }
     fn get_plugin_type(&self) -> Option<PluginType> {
         None
@@ -255,20 +379,74 @@ pub trait Backend: Debug + Send + Sync {
     }
 
     async fn list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<String>> {
+        Ok(self
+            .list_remote_versions_with_info(config)
+            .await?
+            .into_iter()
+            .map(|v| v.version)
+            .collect())
+    }
+
+    /// List remote versions with additional metadata like created_at timestamps.
+    /// Results are cached. Backends can override `_list_remote_versions_with_info`
+    /// to provide timestamp information.
+    ///
+    /// This method first tries the versions host (mise-versions.jdx.dev) which provides
+    /// version info with created_at timestamps. If that fails, it falls back to the
+    /// backend's `_list_remote_versions_with_info` implementation.
+    async fn list_remote_versions_with_info(
+        &self,
+        config: &Arc<Config>,
+    ) -> eyre::Result<Vec<VersionInfo>> {
         let remote_versions = self.get_remote_version_cache();
         let remote_versions = remote_versions.lock().await;
         let ba = self.ba().clone();
         let id = self.id();
+
+        // Check if this is an external plugin with a custom remote - skip versions host if so
+        let use_versions_host = if let Some(plugin) = self.plugin()
+            && let Ok(Some(remote_url)) = plugin.get_remote_url()
+        {
+            // Check if remote matches the registry default
+            let normalized_remote =
+                normalize_remote(&remote_url).unwrap_or_else(|_| "INVALID_URL".into());
+            let shorthand_remote = REGISTRY
+                .get(plugin.name())
+                .and_then(|rt| rt.backends().first().map(|b| full_to_url(b)))
+                .unwrap_or_default();
+            let matches =
+                normalized_remote == normalize_remote(&shorthand_remote).unwrap_or_default();
+            if !matches {
+                trace!(
+                    "Skipping versions host for {} because it has a non-default remote",
+                    ba.short
+                );
+            }
+            matches
+        } else {
+            true // Core plugins and plugins without remote URLs can use versions host
+        };
+
         let versions = remote_versions
             .get_or_try_init_async(|| async {
                 trace!("Listing remote versions for {}", ba.to_string());
-                match versions_host::list_versions(&ba).await {
-                    Ok(Some(versions)) => return Ok(versions),
-                    Ok(None) => {}
-                    Err(e) => {
-                        debug!("Error getting versions from versions host: {:#}", e);
+                // Try versions host first (now returns VersionInfo with timestamps)
+                if use_versions_host {
+                    match versions_host::list_versions(&ba.short).await {
+                        Ok(Some(versions)) => {
+                            trace!(
+                                "Got {} versions from versions host for {}",
+                                versions.len(),
+                                ba.to_string()
+                            );
+                            return Ok(versions);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            debug!("Error getting versions from versions host: {:#}", e);
+                        }
                     }
-                };
+                }
                 trace!(
                     "Calling backend to list remote versions for {}",
                     ba.to_string()
@@ -277,10 +455,10 @@ pub trait Backend: Debug + Send + Sync {
                     ._list_remote_versions(config)
                     .await?
                     .into_iter()
-                    .filter(|v| match v.parse::<ToolVersionType>() {
+                    .filter(|v| match v.version.parse::<ToolVersionType>() {
                         Ok(ToolVersionType::Version(_)) => true,
                         _ => {
-                            warn!("Invalid version: {id}@{v}");
+                            warn!("Invalid version: {id}@{}", v.version);
                             false
                         }
                     })
@@ -293,7 +471,12 @@ pub trait Backend: Debug + Send + Sync {
             .await?;
         Ok(versions.clone())
     }
-    async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<String>>;
+
+    /// Backend implementation for fetching remote versions with metadata.
+    /// Override this to provide version listing with optional timestamp information.
+    /// Return `VersionInfo` with `created_at: None` if timestamps are not available.
+    async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>>;
+
     async fn latest_stable_version(&self, config: &Arc<Config>) -> eyre::Result<Option<String>> {
         self.latest_version(config, Some("latest".into())).await
     }
@@ -334,10 +517,10 @@ pub trait Backend: Debug + Send + Sync {
         match tv.request {
             ToolRequest::System { .. } => true,
             _ => {
-                if let Some(install_path) = tv.request.install_path(config) {
-                    if check_path(&install_path, true) {
-                        return true;
-                    }
+                if let Some(install_path) = tv.request.install_path(config)
+                    && check_path(&install_path, true)
+                {
+                    return true;
                 }
                 check_path(&tv.install_path(), check_symlink)
             }
@@ -384,6 +567,34 @@ pub trait Backend: Debug + Send + Sync {
         let versions = self.list_remote_versions(config).await?;
         Ok(self.fuzzy_match_filter(versions, query))
     }
+
+    /// List versions matching a query, optionally filtered by release date.
+    /// Use this when you have a `before_date` from ResolveOptions.
+    async fn list_versions_matching_with_opts(
+        &self,
+        config: &Arc<Config>,
+        query: &str,
+        before_date: Option<Timestamp>,
+    ) -> eyre::Result<Vec<String>> {
+        let versions = match before_date {
+            Some(before) => {
+                // Use version info to filter by date
+                let versions_with_info = self.list_remote_versions_with_info(config).await?;
+                let filtered = VersionInfo::filter_by_date(versions_with_info, before);
+                // Warn if no versions have timestamps
+                if filtered.iter().all(|v| v.created_at.is_none()) && !filtered.is_empty() {
+                    debug!(
+                        "Backend {} does not provide release dates; --before filter may not work as expected",
+                        self.id()
+                    );
+                }
+                filtered.into_iter().map(|v| v.version).collect()
+            }
+            None => self.list_remote_versions(config).await?,
+        };
+        Ok(self.fuzzy_match_filter(versions, query))
+    }
+
     async fn latest_version(
         &self,
         config: &Arc<Config>,
@@ -398,6 +609,52 @@ pub trait Backend: Debug + Send + Sync {
                 Ok(find_match_in_list(&matches, &query))
             }
             None => self.latest_stable_version(config).await,
+        }
+    }
+
+    /// Get the latest version, optionally filtered by release date.
+    /// Use this when you have a `before_date` from ResolveOptions.
+    async fn latest_version_with_opts(
+        &self,
+        config: &Arc<Config>,
+        query: Option<String>,
+        before_date: Option<Timestamp>,
+    ) -> eyre::Result<Option<String>> {
+        match query {
+            Some(query) => {
+                let mut matches = self
+                    .list_versions_matching_with_opts(config, &query, before_date)
+                    .await?;
+                if matches.is_empty() && query == "latest" {
+                    // Fall back to all versions if no match
+                    matches = match before_date {
+                        Some(before) => {
+                            let versions_with_info =
+                                self.list_remote_versions_with_info(config).await?;
+                            VersionInfo::filter_by_date(versions_with_info, before)
+                                .into_iter()
+                                .map(|v| v.version)
+                                .collect()
+                        }
+                        None => self.list_remote_versions(config).await?,
+                    };
+                }
+                Ok(find_match_in_list(&matches, &query))
+            }
+            None => {
+                // For stable version, apply date filter if provided
+                match before_date {
+                    Some(before) => {
+                        let versions_with_info =
+                            self.list_remote_versions_with_info(config).await?;
+                        let filtered = VersionInfo::filter_by_date(versions_with_info, before);
+                        let versions: Vec<String> =
+                            filtered.into_iter().map(|v| v.version).collect();
+                        Ok(find_match_in_list(&versions, "latest"))
+                    }
+                    None => self.latest_stable_version(config).await,
+                }
+            }
         }
     }
     fn latest_installed_version(&self, query: Option<String>) -> eyre::Result<Option<String>> {
@@ -498,8 +755,36 @@ pub trait Backend: Debug + Send + Sync {
                 return Ok(tv);
             }
         }
+        // Check for --locked mode: if enabled and no lockfile URL exists, fail early
+        if ctx.locked {
+            let platform_key = self.get_platform_key();
+            let has_lockfile_url = tv
+                .lock_platforms
+                .get(&platform_key)
+                .and_then(|p| p.url.as_ref())
+                .is_some();
+            if !has_lockfile_url {
+                bail!(
+                    "No lockfile URL found for {} on platform {} (--locked mode)\n\
+                    hint: Run `mise lock` to generate lockfile URLs, or disable locked mode",
+                    tv.style(),
+                    platform_key
+                );
+            }
+        }
+
+        // Track the installation asynchronously (fire-and-forget)
+        // Do this before install so the request has time to complete during installation
+        versions_host::track_install(tv.short(), &tv.ba().full(), &tv.version);
+
         ctx.pr.set_message("install".into());
         let _lock = lock_file::get(&tv.install_path(), ctx.force)?;
+
+        // Double-checked (locking) that it wasn't installed while we were waiting for the lock
+        if self.is_version_installed(&ctx.config, &tv, true) && !ctx.force {
+            return Ok(tv);
+        }
+
         self.create_install_dirs(&tv)?;
 
         let old_tv = tv.clone();
@@ -532,10 +817,10 @@ pub trait Backend: Debug + Send + Sync {
             debug!("error removing incomplete file: {:?}", err);
         } else {
             // Sync parent directory to ensure file removal is immediately visible
-            if let Some(parent) = incomplete_path.parent() {
-                if let Err(err) = file::sync_dir(parent) {
-                    debug!("error syncing incomplete file parent directory: {:?}", err);
-                }
+            if let Some(parent) = incomplete_path.parent()
+                && let Err(err) = file::sync_dir(parent)
+            {
+                debug!("error syncing incomplete file parent directory: {:?}", err);
             }
         }
         if let Some(script) = tv.request.options().get("postinstall") {
@@ -544,7 +829,6 @@ pub trait Backend: Debug + Send + Sync {
             self.run_postinstall_hook(&ctx, &tv, script).await?;
         }
         ctx.pr.finish_with_message("installed".to_string());
-
         Ok(tv)
     }
 
@@ -780,12 +1064,35 @@ pub trait Backend: Debug + Send + Sync {
 
     fn fuzzy_match_filter(&self, versions: Vec<String>, query: &str) -> Vec<String> {
         let escaped_query = regex::escape(query);
-        let query = if query == "latest" {
+        let query_pattern = if query == "latest" {
             "v?[0-9].*"
         } else {
             &escaped_query
         };
-        let query_regex = Regex::new(&format!("^{query}([-.].+)?$")).unwrap();
+        // For numeric-ish prefixes like "1.2" we want to match "1.2.3" / "1.2-rc1" etc,
+        // but NOT "1.20". The old pattern achieved this by requiring a separator after the query.
+        // However, vendor-prefixed queries like "temurin-" need to match digits immediately after
+        // the prefix (e.g. "temurin-25.0.1").
+        let query_regex = if query != "latest" && query.ends_with('-') {
+            Regex::new(&format!("^{query_pattern}.*$")).unwrap()
+        } else {
+            Regex::new(&format!("^{query_pattern}([+\\-.].+)?$")).unwrap()
+        };
+
+        // Also create a regex without the 'v' prefix if query starts with 'v'
+        // This allows "v1.0.0" to match "1.0.0" in registries that don't use v-prefix
+        let query_without_v_regex = if query.starts_with('v') || query.starts_with('V') {
+            let without_v = regex::escape(&query[1..]);
+            let re = if query.ends_with('-') {
+                Regex::new(&format!("^{without_v}.*$")).unwrap()
+            } else {
+                Regex::new(&format!("^{without_v}([+\\-.].+)?$")).unwrap()
+            };
+            Some(re)
+        } else {
+            None
+        };
+
         versions
             .into_iter()
             .filter(|v| {
@@ -795,7 +1102,16 @@ pub trait Backend: Debug + Send + Sync {
                 if VERSION_REGEX.is_match(v) {
                     return false;
                 }
-                query_regex.is_match(v)
+                if query_regex.is_match(v) {
+                    return true;
+                }
+                // Try matching without the 'v' prefix
+                if let Some(ref re) = query_without_v_regex
+                    && re.is_match(v)
+                {
+                    return true;
+                }
+                false
             })
             .collect()
     }
@@ -868,9 +1184,7 @@ pub trait Backend: Debug + Send + Sync {
                 );
             }
         } else if lockfile_enabled {
-            ctx.pr.set_message(format!("record size {filename}"));
-            let size = file.metadata()?.len();
-            platform_info.size = Some(size);
+            platform_info.size = Some(file.metadata()?.len());
         }
         Ok(())
     }
@@ -880,6 +1194,7 @@ pub trait Backend: Debug + Send + Sync {
         _config: &Arc<Config>,
         _tv: &ToolVersion,
         _bump: bool,
+        _opts: &ResolveOptions,
     ) -> Result<Option<OutdatedInfo>> {
         Ok(None)
     }
@@ -945,7 +1260,6 @@ pub trait Backend: Debug + Send + Sync {
         // 3. Handle any URL-specific logic
         Ok(PlatformInfo {
             checksum: None, // TODO: Implement checksum fetching
-            name: None,     // TODO: Implement name extraction from URL if needed
             size: None,     // TODO: Implement size fetching via HEAD request
             url: Some(tarball_url.to_string()),
             url_api: None,
@@ -965,15 +1279,20 @@ pub trait Backend: Debug + Send + Sync {
         // 1. Query GitHub/GitLab release API
         // 2. Find matching asset for the target platform
         // 3. Extract download URL, size, and checksums
-        let asset_url = release_info.asset_pattern.as_ref().map(|pattern| {
+        let asset_name = release_info.asset_pattern.as_ref().map(|pattern| {
             pattern
                 .replace("{os}", target.os_name())
                 .replace("{arch}", target.arch_name())
         });
 
+        // Combine api_url (base URL) with asset_name to get full download URL
+        let asset_url = match (&release_info.api_url, &asset_name) {
+            (Some(base_url), Some(name)) => Some(format!("{}/{}", base_url, name)),
+            _ => asset_name.clone(),
+        };
+
         Ok(PlatformInfo {
             checksum: None, // TODO: Implement checksum fetching from releases
-            name: None,     // TODO: Implement asset name fetching from releases
             size: None,     // TODO: Implement size fetching from GitHub API
             url: asset_url,
             url_api: None,
@@ -992,7 +1311,6 @@ pub trait Backend: Debug + Send + Sync {
         Ok(PlatformInfo {
             checksum: None,
             size: None,
-            name: None,
             url: None,
             url_api: None,
         })
@@ -1023,8 +1341,16 @@ pub fn unalias_backend(backend: &str) -> &str {
     match backend {
         "nodejs" => "node",
         "golang" => "go",
-        _ => backend,
+        _ => backend.trim_start_matches("core:"),
     }
+}
+
+#[test]
+fn test_unalias_backend() {
+    assert_eq!(unalias_backend("node"), "node");
+    assert_eq!(unalias_backend("nodejs"), "node");
+    assert_eq!(unalias_backend("core:node"), "node");
+    assert_eq!(unalias_backend("golang"), "go");
 }
 
 impl Display for dyn Backend {

@@ -6,6 +6,7 @@ use heck::{
     ToKebabCase, ToLowerCamelCase, ToShoutyKebabCase, ToShoutySnakeCase, ToSnakeCase,
     ToUpperCamelCase,
 };
+use path_absolutize::Absolutize;
 use rand::prelude::*;
 use std::sync::LazyLock as Lazy;
 use tera::{Context, Tera, Value};
@@ -90,6 +91,26 @@ static TERA: Lazy<Tera> = Lazy::new(|| {
             }
         },
     );
+    tera.register_function(
+        "haiku",
+        move |args: &HashMap<String, Value>| -> tera::Result<Value> {
+            let words = args
+                .get("words")
+                .and_then(Value::as_u64)
+                .unwrap_or(2)
+                .max(1) as usize;
+            let separator = args.get("separator").and_then(Value::as_str).unwrap_or("-");
+            let digits = args.get("digits").and_then(Value::as_u64).unwrap_or(2) as usize;
+
+            let result = xx::rand::haiku(&xx::rand::HaikuOptions {
+                words,
+                separator,
+                digits,
+            });
+
+            Ok(Value::String(result))
+        },
+    );
     tera.register_filter(
         "hash_file",
         move |input: &Value, args: &HashMap<String, Value>| match input {
@@ -117,8 +138,16 @@ static TERA: Lazy<Tera> = Lazy::new(|| {
             _ => Err("hash input must be a string".into()),
         },
     );
-    // TODO: add `absolute` feature.
-    // wait until #![feature(absolute_path)] hits Rust stable release channel
+    tera.register_filter(
+        "absolute",
+        move |input: &Value, _args: &HashMap<String, Value>| match input {
+            Value::String(s) => {
+                let p = Path::new(s).absolutize()?;
+                Ok(Value::String(p.to_string_lossy().to_string()))
+            }
+            _ => Err("absolute input must be a string".into()),
+        },
+    );
     tera.register_filter(
         "canonicalize",
         move |input: &Value, _args: &HashMap<String, Value>| match input {
@@ -129,44 +158,47 @@ static TERA: Lazy<Tera> = Lazy::new(|| {
             _ => Err("canonicalize input must be a string".into()),
         },
     );
+    // Helper to create path filters that handle empty strings gracefully
+    fn path_filter<F>(input: &Value, name: &'static str, f: F) -> tera::Result<Value>
+    where
+        F: FnOnce(&Path) -> Option<String>,
+    {
+        match input {
+            Value::String(s) if s.is_empty() => Ok(Value::String(String::new())),
+            Value::String(s) => Ok(Value::String(f(Path::new(s)).unwrap_or_default())),
+            _ => Err(format!("{name} input must be a string").into()),
+        }
+    }
     tera.register_filter(
         "dirname",
-        move |input: &Value, _args: &HashMap<String, Value>| match input {
-            Value::String(s) => {
-                let p = Path::new(s).parent().unwrap();
-                Ok(Value::String(p.to_string_lossy().to_string()))
-            }
-            _ => Err("dirname input must be a string".into()),
+        move |input: &Value, _args: &HashMap<String, Value>| {
+            path_filter(input, "dirname", |p| {
+                p.parent().map(|p| p.to_string_lossy().to_string())
+            })
         },
     );
     tera.register_filter(
         "basename",
-        move |input: &Value, _args: &HashMap<String, Value>| match input {
-            Value::String(s) => {
-                let p = Path::new(s).file_name().unwrap();
-                Ok(Value::String(p.to_string_lossy().to_string()))
-            }
-            _ => Err("basename input must be a string".into()),
+        move |input: &Value, _args: &HashMap<String, Value>| {
+            path_filter(input, "basename", |p| {
+                p.file_name().map(|p| p.to_string_lossy().to_string())
+            })
         },
     );
     tera.register_filter(
         "extname",
-        move |input: &Value, _args: &HashMap<String, Value>| match input {
-            Value::String(s) => {
-                let p = Path::new(s).extension().unwrap();
-                Ok(Value::String(p.to_string_lossy().to_string()))
-            }
-            _ => Err("extname input must be a string".into()),
+        move |input: &Value, _args: &HashMap<String, Value>| {
+            path_filter(input, "extname", |p| {
+                p.extension().map(|p| p.to_string_lossy().to_string())
+            })
         },
     );
     tera.register_filter(
         "file_stem",
-        move |input: &Value, _args: &HashMap<String, Value>| match input {
-            Value::String(s) => {
-                let p = Path::new(s).file_stem().unwrap();
-                Ok(Value::String(p.to_string_lossy().to_string()))
-            }
-            _ => Err("filename input must be a string".into()),
+        move |input: &Value, _args: &HashMap<String, Value>| {
+            path_filter(input, "file_stem", |p| {
+                p.file_stem().map(|p| p.to_string_lossy().to_string())
+            })
         },
     );
     tera.register_filter(
@@ -528,6 +560,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_haiku() {
+        let _config = Config::get().await.unwrap();
+        // Default: 2 words + number
+        let result = render("{{haiku()}}");
+        let parts: Vec<&str> = result.split('-').collect();
+        assert_eq!(parts.len(), 3);
+        assert!(!parts[0].is_empty());
+        assert!(!parts[1].is_empty());
+        assert!(parts[2].parse::<u32>().is_ok());
+
+        // Custom: 3 words, no digits, underscore separator
+        let result = render("{{haiku(words=3, digits=0, separator=\"_\")}}");
+        let parts: Vec<&str> = result.split('_').collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts.iter().all(|p| p.parse::<u32>().is_err())); // no numbers
+    }
+
+    #[tokio::test]
     async fn test_quote() {
         let _config = Config::get().await.unwrap();
         let s = render("{{ \"quoted'str\" | quote }}");
@@ -589,6 +639,17 @@ mod tests {
         let _config = Config::get().await.unwrap();
         let s = render("{{ \"../fixtures/shorthands.toml\" | hash_file(len=64) }}");
         insta::assert_snapshot!(s, @"ce17f44735ea2083038e61c4b291ed31593e6cf4d93f5dc147e97e62962ac4e6");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_absolute() {
+        let _config = Config::get().await.unwrap();
+        let s = render("{{ \"/a/b/../c\" | absolute }}");
+        assert_eq!(s, "/a/c");
+        // relative path
+        let s = render("{{ \"a/b/../c\" | absolute }}");
+        assert!(s.ends_with("/a/c"));
     }
 
     #[tokio::test]

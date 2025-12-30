@@ -1,6 +1,9 @@
 import * as fsAsync from "node:fs/promises";
 import * as ts from "typescript";
 import * as path from "path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 type GeneratorIdentifier = {
   identifier: string;
@@ -11,6 +14,10 @@ const customGenerators: GeneratorIdentifier[] = [
   {
     identifier: "alias",
     generator_name: "aliasGenerator",
+  },
+  {
+    identifier: "shell_alias",
+    generator_name: "shellAliasGenerator",
   },
   {
     identifier: "plugin",
@@ -123,6 +130,33 @@ function transformer<T extends ts.Node>(context: ts.TransformationContext) {
         }
       }
       const newNode = ts.visitEachChild(node, visit, context);
+      // Add generators to objects that should have them but don't
+      if (
+        newNode &&
+        has_property(newNode, '"name"') &&
+        has_property(newNode, '"description"') &&
+        !has_property(newNode, '"generators"') &&
+        !has_property(newNode, '"subcommands"') &&
+        !has_property(newNode, '"options"')
+      ) {
+        const id = get_identifier(newNode);
+        if (id) {
+          const objLiteralExpr = newNode as ts.ObjectLiteralExpression;
+          const generatorsProperty = ts.factory.createPropertyAssignment(
+            '"generators"',
+            id
+          );
+          const debounceProperty = ts.factory.createPropertyAssignment(
+            '"debounce"',
+            ts.factory.createIdentifier("true")
+          );
+          return ts.factory.updateObjectLiteralExpression(objLiteralExpr, [
+            ...objLiteralExpr.properties,
+            generatorsProperty,
+            debounceProperty,
+          ]);
+        }
+      }
       if (
         newNode &&
         has_property(newNode, '"generators"') &&

@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
 use std::{path::PathBuf, sync::Arc};
 
 use crate::backend::Backend;
+use crate::backend::VersionInfo;
+use crate::backend::platform_target::PlatformTarget;
 use crate::cli::args::BackendArg;
 use crate::config::{Config, Settings};
 #[cfg(unix)]
@@ -10,7 +13,7 @@ use crate::http::{HTTP, HTTP_FETCH};
 use crate::install_context::InstallContext;
 use crate::lock_file::LockFile;
 use crate::toolset::{ToolRequest, ToolVersion};
-use crate::{cmd, file, github, plugins};
+use crate::{file, github, plugins};
 use async_trait::async_trait;
 use eyre::Result;
 use xx::regex;
@@ -25,7 +28,7 @@ pub struct ErlangPlugin {
     ba: Arc<BackendArg>,
 }
 
-const KERL_VERSION: &str = "4.1.1";
+const KERL_VERSION: &str = "4.4.0";
 
 impl ErlangPlugin {
     pub fn new() -> Self {
@@ -303,12 +306,21 @@ impl Backend for ErlangPlugin {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
         let versions = if Settings::get().erlang.compile == Some(false) {
             github::list_releases("erlef/otp_builds")
                 .await?
                 .into_iter()
-                .filter_map(|r| r.tag_name.strip_prefix("OTP-").map(|s| s.to_string()))
+                .filter_map(|r| {
+                    r.tag_name
+                        .strip_prefix("OTP-")
+                        .map(|s| (s.to_string(), Some(r.created_at)))
+                })
+                .map(|(version, created_at)| VersionInfo {
+                    version,
+                    created_at,
+                    ..Default::default()
+                })
                 .collect()
         } else {
             self.update_kerl().await?;
@@ -319,7 +331,10 @@ impl Backend for ErlangPlugin {
                 let versions = output
                     .split('\n')
                     .filter(|s| regex!(r"^[0-9].+$").is_match(s))
-                    .map(|s| s.to_string())
+                    .map(|s| VersionInfo {
+                        version: s.to_string(),
+                        ..Default::default()
+                    })
                     .collect();
                 Ok(versions)
             })?
@@ -332,6 +347,28 @@ impl Backend for ErlangPlugin {
             return Ok(tv);
         }
         self.install_via_kerl(ctx, tv).await
+    }
+
+    fn resolve_lockfile_options(
+        &self,
+        _request: &ToolRequest,
+        target: &PlatformTarget,
+    ) -> BTreeMap<String, String> {
+        let mut opts = BTreeMap::new();
+        let settings = Settings::get();
+        let is_current_platform = target.is_current();
+
+        // Only include compile option if true (non-default)
+        let compile = if is_current_platform {
+            settings.erlang.compile.unwrap_or(false)
+        } else {
+            false
+        };
+        if compile {
+            opts.insert("compile".to_string(), "true".to_string());
+        }
+
+        opts
     }
 }
 

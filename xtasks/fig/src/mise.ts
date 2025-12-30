@@ -1,3 +1,446 @@
+// If not being published, these need to manually downloaded from https://github.com/withfig/autocomplete/tree/master/src
+/* eslint-disable @withfig/fig-linter/conventional-descriptions */
+import { createNpmSearchHandler } from "./npm";
+import { searchGenerator as createCargoSearchGenerator } from "./cargo";
+
+const singleCmdNewLineGenerator = (completion_cmd: string): Fig.Generator => ({
+  script: completion_cmd.split(" "),
+  splitOn: "\n",
+});
+
+const singleCmdJsonGenerator = (cmd: string): Fig.Generator => ({
+  script: cmd.split(" "),
+  postProcess: (out) =>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    JSON.parse(out).map((r: any) => ({
+      name: r.name,
+      description: r.description,
+    })),
+});
+
+const contextualGeneratorLastWord = (cmd: string): Fig.Generator => ({
+  script: (context) => {
+    if (context.length < 2) {
+      return [];
+    }
+
+    const prev = context[context.length - 2]; // -1 is the current word
+    return ["sh", "-c", [cmd, prev].join(" ")];
+  },
+});
+
+const aliasGenerator: Fig.Generator = {
+  ...contextualGeneratorLastWord("mise alias ls"),
+  postProcess: (out) => {
+    //return [{name: out}]
+    //return out.split('\t').map(l => ({name: l}))
+    //return [{name: "test", "description": out}]
+    const tokens = out.split(/\s+/);
+    if (tokens.length == 0) return [];
+
+    return tokens
+      .flatMap((_, i) => {
+        if (i % 3 == 0) {
+          return [tokens[i + 1]];
+        }
+        return [];
+      })
+      .filter((l) => l.trim().length > 0)
+      .map((l) => ({ name: l.trim() }));
+  },
+};
+
+const shellAliasGenerator: Fig.Generator = {
+  script: ["sh", "-c", "mise shell-alias ls --no-header"],
+  postProcess: (out) => {
+    if (!out.trim()) return [];
+    return out
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => {
+        const tokens = l.split(/\s+/);
+        return { name: tokens[0], description: tokens.slice(1).join(" ") };
+      });
+  },
+};
+
+const pluginWithAlias: Fig.Generator = {
+  script: "mise alias ls".split(" "),
+  postProcess: (output: string) => {
+    const plugins = output.split("\n").map((line) => {
+      const tokens = line.split(/\s+/);
+      return tokens[0];
+    });
+    return [...new Set(plugins)].map((p) => ({ name: p }));
+  },
+};
+
+const getInstalledTools = async (
+  executeShellCommand: Fig.ExecuteCommandFunction
+) => {
+  const { stdout } = await executeShellCommand({
+    command: "sh",
+    args: ["-c", "mise ls --installed"],
+  });
+  return [
+    ...new Set(
+      stdout.split("\n").map((l) => {
+        const tokens = l.split(/\s+/);
+        return { name: tokens[0], version: tokens[1] };
+      })
+    ),
+  ];
+};
+
+type ConfigLsOutput = {
+  path: string;
+  tools: string[];
+};
+
+const configPathGenerator: Fig.Generator = {
+  ...singleCmdJsonGenerator("mise config ls -J"),
+  postProcess: (out) =>
+    JSON.parse(out).map((r: ConfigLsOutput) => ({
+      name: r.path,
+      description: r.path,
+    })),
+};
+
+type ObjectKeyType = string | symbol | number;
+type ObjectAcceptableKeyValues = {
+  [key: string]: ObjectKeyType;
+};
+
+function groupBy<T extends ObjectAcceptableKeyValues>(
+  array: T[],
+  key: keyof T
+): Record<T[keyof T], T[]> {
+  return array.reduce(
+    (result, currentItem) => {
+      (result[currentItem[key] as ObjectKeyType] =
+        result[currentItem[key] as ObjectKeyType] || []).push(currentItem);
+      return result;
+    },
+    {} as Record<ObjectKeyType, T[]>
+  );
+}
+
+const installedToolsGenerator: Fig.Generator = {
+  script: ["sh", "-c", "mise ls --installed"],
+  postProcess: (stdout: string) => {
+    return [
+      ...new Set(
+        stdout.split("\n").map((l) => {
+          const tokens = l.split(/\s+/);
+          return { name: tokens[0], version: tokens[1] };
+        })
+      ),
+    ];
+  },
+};
+
+const pluginGenerator: Fig.Generator = installedToolsGenerator;
+const allPluginsGenerator: Fig.Generator =
+  singleCmdNewLineGenerator("mise plugins --all");
+const simpleTaskGenerator = singleCmdJsonGenerator("mise tasks -J");
+const settingsGenerator = singleCmdNewLineGenerator(`mise settings --keys`);
+
+const atsInStr = (s: string) => (s.match(/@/g) || []).length != 0;
+const backendSepInStr = (s: string) => (s.match(/:/g) || []).length != 0;
+
+type GitHubRepoInfo = {
+  name: string;
+  full_name: string;
+  description: string;
+};
+
+type GitHubAssetInfo = {
+  url: string;
+  uploader: object;
+  download_count: number;
+  state: string;
+};
+type GitHubVersionInfo = {
+  assets: string[];
+  tag_name: string;
+  draft: boolean;
+  body: string; // Markdown
+};
+
+const searchGitHub = async (
+  package_name: string,
+  executeShellCommand: Fig.ExecuteCommandFunction,
+  shellContext: Fig.GeneratorContext
+): Promise<Fig.Suggestion[]> => {
+  const query = [
+    "-H",
+    "Accept: application/vnd.github+json",
+    "-H",
+    "X-GitHub-Api-Version: 2022-11-28",
+  ];
+
+  const generalUrl =
+    "https://api.github.com/search/repositories?q=$NAME$+in:name";
+  const versionsUrl = "https://api.github.com/repos/$FULL_NAME$/releases";
+
+  try {
+    const envs = (
+      await executeShellCommand({
+        command: envVarGenerator.script[0],
+        args: envVarGenerator.script.slice(1),
+      })
+    ).stdout
+      .split("\n")
+      .map((l) => ({
+        name: l.split("=")[0].trim(),
+        value: l.split("=")[1].trim(),
+      }));
+
+    const gh_token = envs.find((v) => v.name == "GITHUB_TOKEN");
+    if (gh_token) {
+      query.push("-H");
+      query.push("Authorization: Bearer $TOKEN$");
+      query[query.length - 1] = query[query.length - 1].replace(
+        "$TOKEN$",
+        gh_token.value
+      );
+    }
+
+    const url =
+      package_name[package_name.length - 1] === "@" ? versionsUrl : generalUrl;
+    query.push(url);
+    query[query.length - 1] = query[query.length - 1].replace(
+      "$NAME$",
+      package_name
+    );
+    query[query.length - 1] = query[query.length - 1].replace(
+      "$FULL_NAME$",
+      package_name.slice(0, package_name.length - 1)
+    );
+
+    const { stdout } = await executeShellCommand({
+      command: "curl",
+      args: query,
+    });
+
+    if (package_name[package_name.length - 1] === "@") {
+      const package_real_name = package_name.slice(0, package_name.length - 1);
+      return [
+        ...new Set(
+          (JSON.parse(stdout) as GitHubVersionInfo[])
+            .filter((e) => e.assets.length > 0)
+            .slice(0, 200)
+            .map((e) => ({
+              name: `${package_real_name}@${e.tag_name}`,
+              description: e.body,
+            }))
+        ),
+      ];
+    } else {
+      return [
+        ...new Set(
+          (JSON.parse(stdout).items as GitHubRepoInfo[]).slice(0, 200).map(
+            (entry) =>
+              ({
+                name: entry.full_name,
+                displayName: entry.name,
+                description: entry.description,
+              }) as Fig.Suggestion
+          )
+        ),
+      ];
+    }
+  } catch (error) {
+    return [{ name: "error", description: error as string }];
+  }
+};
+
+const searchBackend = async (
+  backend: string,
+  context: string[],
+  executeShellCommand: Fig.ExecuteCommandFunction,
+  shellContext: Fig.GeneratorContext
+): Promise<Fig.Suggestion[]> => {
+  const customContext = context;
+  customContext[context.length - 1] = customContext[context.length - 1].replace(
+    `${backend}:`,
+    ""
+  );
+  switch (backend) {
+    case "npm":
+      return await createNpmSearchHandler()(
+        context,
+        executeShellCommand,
+        shellContext
+      );
+    case "cargo":
+      return await createCargoSearchGenerator.custom(
+        customContext,
+        executeShellCommand,
+        shellContext
+      );
+    case "asdf":
+      const { stdout } = await executeShellCommand({
+        command: "sh",
+        args: ["-c", "mise registry"],
+      });
+      return [
+        ...new Set(
+          stdout.split("\n").map((l) => {
+            const tokens = l.split(/\s+/);
+            return { name: tokens[1].replace(`${backend}:`, "") };
+          })
+        ),
+      ];
+    case "ubi":
+      return await searchGitHub(
+        customContext[customContext.length - 1],
+        executeShellCommand,
+        shellContext
+      );
+    default:
+      return [];
+  }
+};
+
+const compareVersions = (a: string, b: string): number => {
+  const result = [a, b].sort(); // Unless we can add semversort
+  if (result[0] != a) return 1;
+  return -1;
+};
+
+const getBackends = async (
+  executeShellCommand: Fig.ExecuteCommandFunction
+): Promise<string[]> => {
+  const { stdout, stderr, status } = await executeShellCommand({
+    command: "sh",
+    args: ["-c", "mise backends ls"],
+  });
+  if (status != 0) {
+    return [stderr];
+  }
+  return [stdout];
+};
+
+const toolVersionGenerator: Fig.Generator = {
+  trigger: (newToken: string, oldToken: string): boolean => {
+    return (
+      (backendSepInStr(newToken) && !backendSepInStr(oldToken)) ||
+      (atsInStr(newToken) && !atsInStr(oldToken))
+    );
+  },
+  getQueryTerm: "@",
+
+  custom: async (
+    context: string[],
+    executeShellCommand: Fig.ExecuteCommandFunction,
+    shellContext: Fig.GeneratorContext
+  ): Promise<Fig.Suggestion[]> => {
+    const currentWord = context[context.length - 1];
+    if (backendSepInStr(currentWord)) {
+      // Let's handle backends
+      const backend = currentWord.slice(0, currentWord.lastIndexOf(":"));
+
+      return (
+        await searchBackend(backend, context, executeShellCommand, shellContext)
+      ).map((s) => ({
+        ...s,
+        name: `${backend}:${s.name}`,
+        displayName: s.name as string,
+        icon: "📦",
+      }));
+    } else if (atsInStr(currentWord)) {
+      const tool = currentWord.slice(0, currentWord.lastIndexOf("@"));
+      const { stdout } = await executeShellCommand({
+        command: "sh",
+        args: ["-c", `mise ls-remote ${tool}`],
+      });
+      const remote_versions_suggestions = stdout
+        .split("\n")
+        .sort((a, b) => compareVersions(b, a))
+        .map((l) => ({ name: l }));
+      const { stdout: aliasStdout } = await executeShellCommand({
+        command: "sh",
+        args: ["-c", `mise alias ls ${tool}`],
+      });
+      const aliases_suggestions = aliasStdout.split("\n").map((l) => {
+        const tokens = l.split(/\s+/);
+        return { name: tokens[1] };
+      });
+      return [...aliases_suggestions, ...remote_versions_suggestions];
+    }
+
+    const { stdout: registryStdout } = await executeShellCommand({
+      command: "sh",
+      args: ["-c", "mise registry"],
+    });
+    const registrySuggestions = [
+      ...new Set(
+        registryStdout.split("\n").map((l) => {
+          const tokens = l.split(/\s+/);
+          return { name: tokens[0], description: tokens[1] };
+        })
+      ),
+    ];
+
+    const backendSuggestions = (await getBackends(executeShellCommand)).map(
+      (backend) => ({ name: backend, description: "Backend" })
+    );
+    return [...backendSuggestions, ...registrySuggestions];
+  },
+};
+
+const installedToolVersionGenerator: Fig.Generator = {
+  trigger: "@",
+  getQueryTerm: "@",
+  custom: async (
+    context: string[],
+    executeShellCommand: Fig.ExecuteCommandFunction
+  ) => {
+    const tools = await getInstalledTools(executeShellCommand);
+    const toolsVersions = groupBy(tools, "name");
+
+    const currentWord = context[context.length - 1];
+    if (atsInStr(currentWord)) {
+      const tool = currentWord.slice(0, currentWord.lastIndexOf("@"));
+
+      const { stdout: aliasStdout } = await executeShellCommand({
+        command: "sh",
+        args: ["-c", `mise alias ls ${tool}`],
+      });
+
+      // This lists all aliases even if they are not installed
+      /*
+      const aliases_suggestions = aliasStdout.split('\n').map(l => {
+        const tokens = l.split(/\s+/)
+        return {name: tokens[1], description: tokens[2]}
+      }) as Fig.Suggestion[]
+      */
+
+      const toolVersions = (toolsVersions[tool] || []) as {
+        name: string;
+        version: string;
+      }[];
+      const suggestions = toolVersions.map((s) => ({
+        name: s.version,
+      })) as Fig.Suggestion[];
+
+      return [...suggestions];
+    }
+
+    const suggestions: Fig.Suggestion[] = [];
+    Object.keys(toolsVersions).forEach((k) => {
+      if (toolsVersions[k].length == 1) {
+        suggestions.push({ name: k });
+      } else {
+        suggestions.push({ name: `${k}@` });
+      }
+    });
+
+    return suggestions;
+  },
+};
+
 // @generated by usage-cli from mise.usage.kdl
 const envVarGenerator = {
   script: ["sh", "-c", "env"],
@@ -5,7 +448,6 @@ const envVarGenerator = {
     return output.split("\n").map((l) => ({ name: l.split("=")[0] }));
   },
 };
-
 const usageGenerateSpec = (cmds: string[]) => {
   return async (
     context: string[],
@@ -36,7 +478,6 @@ const usageGenerateSpec = (cmds: string[]) => {
         if (usageFigStatus !== 0) {
           return [{ name: "error", description: figSpecStderr }];
         }
-
         const start_of_json = figSpecOut.indexOf("{");
         const j = figSpecOut.slice(start_of_json);
         return JSON.parse(j).subcommands as Fig.Subcommand[];
@@ -44,7 +485,6 @@ const usageGenerateSpec = (cmds: string[]) => {
         return [{ name: "error", description: e }] as Fig.Subcommand[];
       }
     });
-
     // eslint-disable-next-line compat/compat
     const results = await Promise.allSettled(promises);
     const subcommands = results
@@ -53,11 +493,9 @@ const usageGenerateSpec = (cmds: string[]) => {
     const failed = results
       .filter((p) => p.status === "rejected")
       .map((p) => ({ name: "error", description: p.reason }));
-
     return { subcommands: [...subcommands.flat(), ...failed] } as Fig.Spec;
   };
 };
-
 const completionGeneratorTemplate = (
   argSuggestionBash: string
 ): Fig.Generator => {
@@ -70,7 +508,6 @@ const completionGeneratorTemplate = (
           tokens[tokens.length - 1]
         );
       }
-
       if (tokens.length >= 2) {
         arg = arg.replace(`{{words[PREV]}}`, tokens[tokens.length - 2]);
       }
@@ -83,7 +520,6 @@ const completionGeneratorTemplate = (
     },
   };
 };
-
 const completionSpec: Fig.Spec = {
   name: "mise",
   subcommands: [
@@ -92,12 +528,6 @@ const completionSpec: Fig.Spec = {
       description: "Initializes mise in the current shell session",
       options: [
         {
-          name: "--shims",
-          description:
-            "Use shims instead of modifying PATH\nEffectively the same as:",
-          isRepeatable: false,
-        },
-        {
           name: ["-q", "--quiet"],
           description: "Suppress non-error messages",
           isRepeatable: false,
@@ -105,6 +535,12 @@ const completionSpec: Fig.Spec = {
         {
           name: "--no-hook-env",
           description: "Do not automatically call hook-env",
+          isRepeatable: false,
+        },
+        {
+          name: "--shims",
+          description:
+            "Use shims instead of modifying PATH\nEffectively the same as:",
           isRepeatable: false,
         },
       ],
@@ -116,8 +552,8 @@ const completionSpec: Fig.Spec = {
       },
     },
     {
-      name: ["alias", "a"],
-      description: "Manage version aliases.",
+      name: "tool-alias",
+      description: "Manage tool version aliases.",
       subcommands: [
         {
           name: "get",
@@ -126,23 +562,21 @@ const completionSpec: Fig.Spec = {
             {
               name: "plugin",
               description: "The plugin to show the alias for",
-              generators: completionGeneratorTemplate(
-                `mise plugins --core --user`
-              ),
+              generators: pluginGenerator,
+              debounce: true,
             },
             {
               name: "alias",
               description: "The alias to show",
-              generators: completionGeneratorTemplate(
-                `mise alias ls {{words[PREV]}} | awk '{print $2}'`
-              ),
+              generators: aliasGenerator,
+              debounce: true,
             },
           ],
         },
         {
           name: ["ls", "list"],
           description:
-            "List aliases\nShows the aliases that can be specified.\nThese can come from user config or from plugins in `bin/list-aliases`.",
+            "List tool version aliases\nShows the aliases that can be specified.\nThese can come from user config or from plugins in `bin/list-aliases`.",
           options: [
             {
               name: "--no-header",
@@ -155,6 +589,7 @@ const completionSpec: Fig.Spec = {
             description: "Show aliases for <TOOL>",
             isOptional: true,
             generators: completionGeneratorTemplate(`mise registry --complete`),
+            debounce: true,
           },
         },
         {
@@ -164,16 +599,14 @@ const completionSpec: Fig.Spec = {
             {
               name: "plugin",
               description: "The backend/plugin to set the alias for",
-              generators: completionGeneratorTemplate(
-                `mise plugins --core --user`
-              ),
+              generators: pluginGenerator,
+              debounce: true,
             },
             {
               name: "alias",
               description: "The alias to set",
-              generators: completionGeneratorTemplate(
-                `mise alias ls {{words[PREV]}} | awk '{print $2}'`
-              ),
+              generators: aliasGenerator,
+              debounce: true,
             },
             {
               name: "value",
@@ -189,17 +622,15 @@ const completionSpec: Fig.Spec = {
             {
               name: "plugin",
               description: "The backend/plugin to remove the alias from",
-              generators: completionGeneratorTemplate(
-                `mise plugins --core --user`
-              ),
+              generators: pluginGenerator,
+              debounce: true,
             },
             {
               name: "alias",
               description: "The alias to remove",
               isOptional: true,
-              generators: completionGeneratorTemplate(
-                `mise alias ls {{words[PREV]}} | awk '{print $2}'`
-              ),
+              generators: aliasGenerator,
+              debounce: true,
             },
           ],
         },
@@ -211,9 +642,8 @@ const completionSpec: Fig.Spec = {
           isRepeatable: false,
           args: {
             name: "plugin",
-            generators: completionGeneratorTemplate(
-              `mise plugins --core --user`
-            ),
+            generators: pluginGenerator,
+            debounce: true,
           },
         },
         {
@@ -241,25 +671,8 @@ const completionSpec: Fig.Spec = {
         description: "Tool(s) to look up\ne.g.: ruby@3",
         isOptional: true,
         isVariadic: true,
-        generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+        generators: toolVersionGenerator,
+        debounce: true,
       },
     },
     {
@@ -274,9 +687,8 @@ esac`),
             description: "Plugin(s) to clear cache for e.g.: node, python",
             isOptional: true,
             isVariadic: true,
-            generators: completionGeneratorTemplate(
-              `mise plugins --core --user`
-            ),
+            generators: pluginGenerator,
+            debounce: true,
           },
         },
         {
@@ -288,14 +700,14 @@ esac`),
           description: "Removes stale mise cache files",
           options: [
             {
-              name: "--dry-run",
-              description: "Just show what would be pruned",
-              isRepeatable: false,
-            },
-            {
               name: ["-v", "--verbose"],
               description: "Show pruned files",
               isRepeatable: true,
+            },
+            {
+              name: "--dry-run",
+              description: "Just show what would be pruned",
+              isRepeatable: false,
             },
           ],
           args: {
@@ -303,9 +715,8 @@ esac`),
             description: "Plugin(s) to clear cache for e.g.: node, python",
             isOptional: true,
             isVariadic: true,
-            generators: completionGeneratorTemplate(
-              `mise plugins --core --user`
-            ),
+            generators: pluginGenerator,
+            debounce: true,
           },
         },
       ],
@@ -334,22 +745,22 @@ esac`),
       subcommands: [
         {
           name: ["generate", "g"],
-          description: "[experimental] Generate a mise.toml file",
+          description: "Generate a mise.toml file",
           options: [
-            {
-              name: ["-t", "--tool-versions"],
-              description: "Path to a .tool-versions file to import tools from",
-              isRepeatable: false,
-              args: {
-                name: "tool_versions",
-              },
-            },
             {
               name: ["-o", "--output"],
               description: "Output to file instead of stdout",
               isRepeatable: false,
               args: {
                 name: "output",
+              },
+            },
+            {
+              name: ["-t", "--tool-versions"],
+              description: "Path to a .tool-versions file to import tools from",
+              isRepeatable: false,
+              args: {
+                name: "tool_versions",
               },
             },
           ],
@@ -379,6 +790,11 @@ esac`),
           description: "List config files currently in use",
           options: [
             {
+              name: ["-J", "--json"],
+              description: "Output in JSON format",
+              isRepeatable: false,
+            },
+            {
               name: "--no-header",
               description: "Do not print table header",
               isRepeatable: false,
@@ -386,11 +802,6 @@ esac`),
             {
               name: "--tracked-configs",
               description: "List all tracked config files",
-              isRepeatable: false,
-            },
-            {
-              name: ["-J", "--json"],
-              description: "Output in JSON format",
               isRepeatable: false,
             },
           ],
@@ -439,6 +850,11 @@ esac`),
       ],
       options: [
         {
+          name: ["-J", "--json"],
+          description: "Output in JSON format",
+          isRepeatable: false,
+        },
+        {
           name: "--no-header",
           description: "Do not print table header",
           isRepeatable: false,
@@ -446,11 +862,6 @@ esac`),
         {
           name: "--tracked-configs",
           description: "List all tracked config files",
-          isRepeatable: false,
-        },
-        {
-          name: ["-J", "--json"],
-          description: "Output in JSON format",
           isRepeatable: false,
         },
       ],
@@ -486,7 +897,7 @@ esac`),
     {
       name: "en",
       description:
-        "[experimental] starts a new shell with the mise environment built from the current configuration",
+        "Starts a new shell with the mise environment built from the current configuration",
       options: [
         {
           name: ["-s", "--shell"],
@@ -509,24 +920,13 @@ esac`),
       description: "Exports env vars to activate mise a single time",
       options: [
         {
-          name: ["-J", "--json"],
-          description: "Output in JSON format",
-          isRepeatable: false,
-        },
-        {
-          name: "--json-extended",
-          description:
-            "Output in JSON format with additional information (source, tool)",
-          isRepeatable: false,
-        },
-        {
           name: ["-D", "--dotenv"],
           description: "Output in dotenv format",
           isRepeatable: false,
         },
         {
-          name: "--redacted",
-          description: "Only show redacted environment variables",
+          name: ["-J", "--json"],
+          description: "Output in JSON format",
           isRepeatable: false,
         },
         {
@@ -547,6 +947,17 @@ esac`),
           },
         },
         {
+          name: "--json-extended",
+          description:
+            "Output in JSON format with additional information (source, tool)",
+          isRepeatable: false,
+        },
+        {
+          name: "--redacted",
+          description: "Only show redacted environment variables",
+          isRepeatable: false,
+        },
+        {
           name: "--values",
           description: "Only show values of environment variables",
           isRepeatable: false,
@@ -557,25 +968,8 @@ esac`),
         description: "Tool(s) to use",
         isOptional: true,
         isVariadic: true,
-        generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+        generators: toolVersionGenerator,
+        debounce: true,
       },
     },
     {
@@ -599,6 +993,11 @@ esac`),
           },
         },
         {
+          name: "--no-prepare",
+          description: "Skip automatic dependency preparation",
+          isRepeatable: false,
+        },
+        {
           name: "--raw",
           description:
             "Directly pipe stdin/stdout/stderr from plugin to user Sets --jobs=1",
@@ -611,25 +1010,8 @@ esac`),
           description: "Tool(s) to start e.g.: node@20 python@3.10",
           isOptional: true,
           isVariadic: true,
-          generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+          generators: toolVersionGenerator,
+          debounce: true,
         },
         {
           name: "command",
@@ -664,27 +1046,17 @@ esac`),
     },
     {
       name: ["generate", "gen"],
-      description: "[experimental] Generate files for various tools/services",
+      description: "Generate files for various tools/services",
       subcommands: [
         {
           name: "bootstrap",
-          description:
-            "[experimental] Generate a script to download+execute mise",
+          description: "Generate a script to download+execute mise",
           options: [
             {
               name: ["-l", "--localize"],
               description:
                 "Sandboxes mise internal directories like MISE_DATA_DIR and MISE_CACHE_DIR into a `.mise` directory in the project",
               isRepeatable: false,
-            },
-            {
-              name: "--localized-dir",
-              description: "Directory to put localized data into",
-              isRepeatable: false,
-              args: {
-                name: "localized_dir",
-                template: "folders",
-              },
             },
             {
               name: ["-V", "--version"],
@@ -703,20 +1075,21 @@ esac`),
                 name: "write",
               },
             },
+            {
+              name: "--localized-dir",
+              description: "Directory to put localized data into",
+              isRepeatable: false,
+              args: {
+                name: "localized_dir",
+                template: "folders",
+              },
+            },
           ],
         },
         {
           name: ["config", "g"],
           description: "[experimental] Generate a mise.toml file",
           options: [
-            {
-              name: ["-t", "--tool-versions"],
-              description: "Path to a .tool-versions file to import tools from",
-              isRepeatable: false,
-              args: {
-                name: "tool_versions",
-              },
-            },
             {
               name: ["-o", "--output"],
               description: "Output to file instead of stdout",
@@ -725,20 +1098,20 @@ esac`),
                 name: "output",
               },
             },
+            {
+              name: ["-t", "--tool-versions"],
+              description: "Path to a .tool-versions file to import tools from",
+              isRepeatable: false,
+              args: {
+                name: "tool_versions",
+              },
+            },
           ],
         },
         {
           name: "devcontainer",
-          description: "[experimental] Generate a devcontainer to execute mise",
+          description: "Generate a devcontainer to execute mise",
           options: [
-            {
-              name: ["-n", "--name"],
-              description: "The name of the devcontainer",
-              isRepeatable: false,
-              args: {
-                name: "name",
-              },
-            },
             {
               name: ["-i", "--image"],
               description: "The image to use for the devcontainer",
@@ -753,6 +1126,14 @@ esac`),
               isRepeatable: false,
             },
             {
+              name: ["-n", "--name"],
+              description: "The name of the devcontainer",
+              isRepeatable: false,
+              args: {
+                name: "name",
+              },
+            },
+            {
               name: ["-w", "--write"],
               description: "Write to .devcontainer/devcontainer.json",
               isRepeatable: false,
@@ -761,16 +1142,8 @@ esac`),
         },
         {
           name: ["git-pre-commit", "pre-commit"],
-          description: "[experimental] Generate a git pre-commit hook",
+          description: "Generate a git pre-commit hook",
           options: [
-            {
-              name: "--hook",
-              description: "Which hook to generate (saves to .git/hooks/$hook)",
-              isRepeatable: false,
-              args: {
-                name: "hook",
-              },
-            },
             {
               name: ["-t", "--task"],
               description:
@@ -778,9 +1151,8 @@ esac`),
               isRepeatable: false,
               args: {
                 name: "task",
-                generators: completionGeneratorTemplate(
-                  `mise tasks ls --complete`
-                ),
+                generators: simpleTaskGenerator,
+                debounce: true,
               },
             },
             {
@@ -789,12 +1161,35 @@ esac`),
                 "Write to .git/hooks/pre-commit and make it executable",
               isRepeatable: false,
             },
+            {
+              name: "--hook",
+              description: "Which hook to generate (saves to .git/hooks/$hook)",
+              isRepeatable: false,
+              args: {
+                name: "hook",
+              },
+            },
           ],
         },
         {
           name: "github-action",
-          description: "[experimental] Generate a GitHub Action workflow file",
+          description: "Generate a GitHub Action workflow file",
           options: [
+            {
+              name: ["-t", "--task"],
+              description: "The task to run when the workflow is triggered",
+              isRepeatable: false,
+              args: {
+                name: "task",
+                generators: simpleTaskGenerator,
+                debounce: true,
+              },
+            },
+            {
+              name: ["-w", "--write"],
+              description: "Write to .github/workflows/$name.yml",
+              isRepeatable: false,
+            },
             {
               name: "--name",
               description: "The name of the workflow to generate",
@@ -803,22 +1198,6 @@ esac`),
                 name: "name",
               },
             },
-            {
-              name: ["-t", "--task"],
-              description: "The task to run when the workflow is triggered",
-              isRepeatable: false,
-              args: {
-                name: "task",
-                generators: completionGeneratorTemplate(
-                  `mise tasks ls --complete`
-                ),
-              },
-            },
-            {
-              name: ["-w", "--write"],
-              description: "Write to .github/workflows/$name.yml",
-              isRepeatable: false,
-            },
           ],
         },
         {
@@ -826,14 +1205,14 @@ esac`),
           description: "Generate documentation for tasks in a project",
           options: [
             {
-              name: ["-I", "--index"],
-              description:
-                "Write only an index of tasks, intended for use with `--multi`",
+              name: ["-i", "--inject"],
+              description: "Inserts the documentation into an existing file",
               isRepeatable: false,
             },
             {
-              name: ["-i", "--inject"],
-              description: "Inserts the documentation into an existing file",
+              name: ["-I", "--index"],
+              description:
+                "Write only an index of tasks, intended for use with `--multi`",
               isRepeatable: false,
             },
             {
@@ -870,17 +1249,8 @@ esac`),
         },
         {
           name: "task-stubs",
-          description: "[experimental] Generates shims to run mise tasks",
+          description: "Generates shims to run mise tasks",
           options: [
-            {
-              name: ["-m", "--mise-bin"],
-              description:
-                "Path to a mise bin to use when running the task stub.",
-              isRepeatable: false,
-              args: {
-                name: "mise_bin",
-              },
-            },
             {
               name: ["-d", "--dir"],
               description: "Directory to create task stubs inside of",
@@ -890,47 +1260,21 @@ esac`),
                 template: "folders",
               },
             },
+            {
+              name: ["-m", "--mise-bin"],
+              description:
+                "Path to a mise bin to use when running the task stub.",
+              isRepeatable: false,
+              args: {
+                name: "mise_bin",
+              },
+            },
           ],
         },
         {
           name: "tool-stub",
-          description:
-            "[experimental] Generate a tool stub for HTTP-based tools",
+          description: "Generate a tool stub for HTTP-based tools",
           options: [
-            {
-              name: "--version",
-              description: "Version of the tool",
-              isRepeatable: false,
-              args: {
-                name: "version",
-              },
-            },
-            {
-              name: ["-u", "--url"],
-              description: "URL for downloading the tool",
-              isRepeatable: false,
-              args: {
-                name: "url",
-              },
-            },
-            {
-              name: "--platform-url",
-              description:
-                "Platform-specific URLs in the format platform:url or just url (auto-detect platform)",
-              isRepeatable: true,
-              args: {
-                name: "platform_url",
-              },
-            },
-            {
-              name: "--platform-bin",
-              description:
-                "Platform-specific binary paths in the format platform:path",
-              isRepeatable: true,
-              args: {
-                name: "platform_bin",
-              },
-            },
             {
               name: ["-b", "--bin"],
               description: "Binary path within the extracted archive",
@@ -940,10 +1284,18 @@ esac`),
               },
             },
             {
-              name: "--skip-download",
+              name: "--bootstrap",
               description:
-                "Skip downloading for checksum and binary path detection (faster but less informative)",
+                "Wrap stub in a bootstrap script that installs mise if not already present",
               isRepeatable: false,
+            },
+            {
+              name: "--bootstrap-version",
+              description: "Specify mise version for the bootstrap script",
+              isRepeatable: false,
+              args: {
+                name: "bootstrap_version",
+              },
             },
             {
               name: "--fetch",
@@ -959,6 +1311,46 @@ esac`),
                 name: "http",
               },
             },
+            {
+              name: "--platform-bin",
+              description:
+                "Platform-specific binary paths in the format platform:path",
+              isRepeatable: true,
+              args: {
+                name: "platform_bin",
+              },
+            },
+            {
+              name: "--platform-url",
+              description:
+                "Platform-specific URLs in the format platform:url or just url (auto-detect platform)",
+              isRepeatable: true,
+              args: {
+                name: "platform_url",
+              },
+            },
+            {
+              name: "--skip-download",
+              description:
+                "Skip downloading for checksum and binary path detection (faster but less informative)",
+              isRepeatable: false,
+            },
+            {
+              name: ["-u", "--url"],
+              description: "URL for downloading the tool",
+              isRepeatable: false,
+              args: {
+                name: "url",
+              },
+            },
+            {
+              name: "--version",
+              description: "Version of the tool",
+              isRepeatable: false,
+              args: {
+                name: "version",
+              },
+            },
           ],
           args: {
             name: "output",
@@ -972,14 +1364,14 @@ esac`),
       description: "Removes mise CLI and all related data",
       options: [
         {
-          name: "--config",
-          description: "Also remove config directory",
-          isRepeatable: false,
-        },
-        {
           name: ["-n", "--dry-run"],
           description:
             "List directories that would be removed without actually removing them",
+          isRepeatable: false,
+        },
+        {
+          name: "--config",
+          description: "Also remove config directory",
           isRepeatable: false,
         },
       ],
@@ -988,12 +1380,6 @@ esac`),
       name: ["install", "i"],
       description: "Install a tool version",
       options: [
-        {
-          name: ["-n", "--dry-run"],
-          description:
-            "Show what would be installed without actually installing",
-          isRepeatable: false,
-        },
         {
           name: ["-f", "--force"],
           description: "Force reinstall even if already installed",
@@ -1008,9 +1394,9 @@ esac`),
           },
         },
         {
-          name: "--raw",
+          name: ["-n", "--dry-run"],
           description:
-            "Directly pipe stdin/stdout/stderr from plugin to user Sets --jobs=1",
+            "Show what would be installed without actually installing",
           isRepeatable: false,
         },
         {
@@ -1018,31 +1404,28 @@ esac`),
           description: "Show installation output",
           isRepeatable: true,
         },
+        {
+          name: "--before",
+          description: "Only install versions released before this date",
+          isRepeatable: false,
+          args: {
+            name: "before",
+          },
+        },
+        {
+          name: "--raw",
+          description:
+            "Directly pipe stdin/stdout/stderr from plugin to user Sets --jobs=1",
+          isRepeatable: false,
+        },
       ],
       args: {
         name: "tool@version",
         description: "Tool(s) to install e.g.: node@20",
         isOptional: true,
         isVariadic: true,
-        generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+        generators: toolVersionGenerator,
+        debounce: true,
       },
     },
     {
@@ -1052,25 +1435,8 @@ esac`),
         {
           name: "tool@version",
           description: "Tool to install e.g.: node@20",
-          generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+          generators: toolVersionGenerator,
+          debounce: true,
         },
         {
           name: "path",
@@ -1092,25 +1458,8 @@ esac`),
       args: {
         name: "tool@version",
         description: "Tool to get the latest version of",
-        generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+        generators: toolVersionGenerator,
+        debounce: true,
       },
     },
     {
@@ -1127,25 +1476,8 @@ esac`),
         {
           name: "tool@version",
           description: "Tool name and version to create a symlink for",
-          generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+          generators: toolVersionGenerator,
+          debounce: true,
         },
         {
           name: "path",
@@ -1161,6 +1493,19 @@ esac`),
         "Update lockfile checksums and URLs for all specified platforms",
       options: [
         {
+          name: ["-j", "--jobs"],
+          description: "Number of jobs to run in parallel",
+          isRepeatable: false,
+          args: {
+            name: "jobs",
+          },
+        },
+        {
+          name: ["-n", "--dry-run"],
+          description: "Show what would be updated without making changes",
+          isRepeatable: false,
+        },
+        {
           name: ["-p", "--platform"],
           description:
             "Comma-separated list of platforms to target\ne.g.: linux-x64,macos-arm64,windows-x64\nIf not specified, all platforms already in lockfile will be updated",
@@ -1170,22 +1515,10 @@ esac`),
           },
         },
         {
-          name: ["-f", "--force"],
-          description: "Update all tools even if lockfile data already exists",
+          name: "--local",
+          description:
+            "Update mise.local.lock instead of mise.lock\nUse for tools defined in .local.toml configs",
           isRepeatable: false,
-        },
-        {
-          name: ["-n", "--dry-run"],
-          description: "Show what would be updated without making changes",
-          isRepeatable: false,
-        },
-        {
-          name: ["-j", "--jobs"],
-          description: "Number of jobs to run in parallel\n[default: 4]",
-          isRepeatable: false,
-          args: {
-            name: "jobs",
-          },
         },
       ],
       args: {
@@ -1195,6 +1528,7 @@ esac`),
         isOptional: true,
         isVariadic: true,
         generators: completionGeneratorTemplate(`mise registry --complete`),
+        debounce: true,
       },
     },
     {
@@ -1214,20 +1548,9 @@ esac`),
           isRepeatable: false,
         },
         {
-          name: ["-l", "--local"],
-          description:
-            "Only show tool versions currently specified in the local mise.toml",
-          isRepeatable: false,
-        },
-        {
           name: ["-i", "--installed"],
           description:
             "Only show tool versions that are installed (Hides tools defined in mise.toml but not installed)",
-          isRepeatable: false,
-        },
-        {
-          name: "--outdated",
-          description: "Display whether a version is outdated",
           isRepeatable: false,
         },
         {
@@ -1236,8 +1559,24 @@ esac`),
           isRepeatable: false,
         },
         {
+          name: ["-l", "--local"],
+          description:
+            "Only show tool versions currently specified in the local mise.toml",
+          isRepeatable: false,
+        },
+        {
           name: ["-m", "--missing"],
           description: "Display missing tool versions",
+          isRepeatable: false,
+        },
+        {
+          name: "--no-header",
+          description: "Don't display headers",
+          isRepeatable: false,
+        },
+        {
+          name: "--outdated",
+          description: "Display whether a version is outdated",
           isRepeatable: false,
         },
         {
@@ -1249,16 +1588,12 @@ esac`),
             generators: completionGeneratorTemplate(
               `mise ls-remote {{words[PREV]}}`
             ),
+            debounce: true,
           },
         },
         {
           name: "--prunable",
           description: "List only tools that can be pruned with `mise prune`",
-          isRepeatable: false,
-        },
-        {
-          name: "--no-header",
-          description: "Don't display headers",
           isRepeatable: false,
         },
       ],
@@ -1270,6 +1605,7 @@ esac`),
         generators: completionGeneratorTemplate(
           `mise ls -i | awk '{print $1}' | uniq`
         ),
+        debounce: true,
       },
     },
     {
@@ -1281,31 +1617,20 @@ esac`),
           description: "Show all installed plugins and versions",
           isRepeatable: false,
         },
+        {
+          name: ["-J", "--json"],
+          description:
+            "Output in JSON format (includes version metadata like created_at timestamps when available)",
+          isRepeatable: false,
+        },
       ],
       args: [
         {
           name: "tool@version",
           description: "Tool to get versions for",
           isOptional: true,
-          generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+          generators: toolVersionGenerator,
+          debounce: true,
         },
         {
           name: "prefix",
@@ -1315,6 +1640,7 @@ esac`),
           generators: completionGeneratorTemplate(
             `mise ls-remote {{words[PREV]}}`
           ),
+          debounce: true,
         },
       ],
     },
@@ -1327,14 +1653,14 @@ esac`),
       description: "Shows outdated tool versions",
       options: [
         {
-          name: ["-l", "--bump"],
-          description:
-            "Compares against the latest versions available, not what matches the current config",
+          name: ["-J", "--json"],
+          description: "Output in JSON format",
           isRepeatable: false,
         },
         {
-          name: ["-J", "--json"],
-          description: "Output in JSON format",
+          name: ["-l", "--bump"],
+          description:
+            "Compares against the latest versions available, not what matches the current config",
           isRepeatable: false,
         },
         {
@@ -1349,25 +1675,8 @@ esac`),
           "Tool(s) to show outdated versions for\ne.g.: node@20 python@3.10\nIf not specified, all tools in global and local configs will be shown",
         isOptional: true,
         isVariadic: true,
-        generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+        generators: toolVersionGenerator,
+        debounce: true,
       },
     },
     {
@@ -1379,20 +1688,15 @@ esac`),
           description: "Install a plugin",
           options: [
             {
-              name: ["-f", "--force"],
-              description: "Reinstall even if plugin exists",
-              isRepeatable: false,
-            },
-            {
               name: ["-a", "--all"],
               description:
                 "Install all missing plugins\nThis will only install plugins that have matching shorthands.\ni.e.: they don't need the full git repo url",
               isRepeatable: false,
             },
             {
-              name: ["-v", "--verbose"],
-              description: "Show installation output",
-              isRepeatable: true,
+              name: ["-f", "--force"],
+              description: "Reinstall even if plugin exists",
+              isRepeatable: false,
             },
             {
               name: ["-j", "--jobs"],
@@ -1402,6 +1706,11 @@ esac`),
                 name: "jobs",
               },
             },
+            {
+              name: ["-v", "--verbose"],
+              description: "Show installation output",
+              isRepeatable: true,
+            },
           ],
           args: [
             {
@@ -1410,6 +1719,7 @@ esac`),
                 "The name of the plugin to install\ne.g.: node, ruby\nCan specify multiple plugins: `mise plugins install node ruby python`",
               isOptional: true,
               generators: completionGeneratorTemplate(`mise plugins --all`),
+              debounce: true,
             },
             {
               name: "git_url",
@@ -1476,14 +1786,14 @@ esac`),
           description: "Removes a plugin",
           options: [
             {
-              name: ["-p", "--purge"],
-              description:
-                "Also remove the plugin's installs, downloads, and cache",
+              name: ["-a", "--all"],
+              description: "Remove all plugins",
               isRepeatable: false,
             },
             {
-              name: ["-a", "--all"],
-              description: "Remove all plugins",
+              name: ["-p", "--purge"],
+              description:
+                "Also remove the plugin's installs, downloads, and cache",
               isRepeatable: false,
             },
           ],
@@ -1492,9 +1802,8 @@ esac`),
             description: "Plugin(s) to remove",
             isOptional: true,
             isVariadic: true,
-            generators: completionGeneratorTemplate(
-              `mise plugins --core --user`
-            ),
+            generators: pluginGenerator,
+            debounce: true,
           },
         },
         {
@@ -1515,9 +1824,8 @@ esac`),
             description: "Plugin(s) to update",
             isOptional: true,
             isVariadic: true,
-            generators: completionGeneratorTemplate(
-              `mise plugins --core --user`
-            ),
+            generators: pluginGenerator,
+            debounce: true,
           },
         },
       ],
@@ -1529,15 +1837,52 @@ esac`),
           isRepeatable: false,
         },
         {
-          name: "--user",
-          description: "List installed plugins",
-          isRepeatable: false,
-        },
-        {
           name: ["-u", "--urls"],
           description:
             "Show the git url for each plugin\ne.g.: https://github.com/asdf-vm/asdf-nodejs.git",
           isRepeatable: false,
+        },
+        {
+          name: "--user",
+          description: "List installed plugins",
+          isRepeatable: false,
+        },
+      ],
+    },
+    {
+      name: ["prepare", "prep"],
+      description: "[experimental] Ensure project dependencies are ready",
+      options: [
+        {
+          name: ["-f", "--force"],
+          description: "Force run all prepare steps even if outputs are fresh",
+          isRepeatable: false,
+        },
+        {
+          name: "--list",
+          description: "Show what prepare steps are available",
+          isRepeatable: false,
+        },
+        {
+          name: ["-n", "--dry-run"],
+          description: "Only check if prepare is needed, don't run commands",
+          isRepeatable: false,
+        },
+        {
+          name: "--only",
+          description: "Run specific prepare rule(s) only",
+          isRepeatable: true,
+          args: {
+            name: "only",
+          },
+        },
+        {
+          name: "--skip",
+          description: "Skip specific prepare rule(s)",
+          isRepeatable: true,
+          args: {
+            name: "skip",
+          },
         },
       ],
     },
@@ -1570,6 +1915,7 @@ esac`),
         generators: completionGeneratorTemplate(
           `mise ls -i | awk '{print $1}' | uniq`
         ),
+        debounce: true,
       },
     },
     {
@@ -1583,11 +1929,17 @@ esac`),
           args: {
             name: "backend",
             generators: completionGeneratorTemplate(`mise backends`),
+            debounce: true,
           },
         },
         {
           name: "--hide-aliased",
           description: "Hide aliased tools",
+          isRepeatable: false,
+        },
+        {
+          name: ["-J", "--json"],
+          description: "Output in JSON format",
           isRepeatable: false,
         },
       ],
@@ -1614,8 +1966,8 @@ esac`),
       description: "Run task(s)",
       options: [
         {
-          name: "--no-cache",
-          description: "Do not use cache on remote tasks",
+          name: ["-c", "--continue-on-error"],
+          description: "Continue running tasks even if one fails",
           isRepeatable: false,
         },
         {
@@ -1627,56 +1979,9 @@ esac`),
           },
         },
         {
-          name: ["-c", "--continue-on-error"],
-          description: "Continue running tasks even if one fails",
-          isRepeatable: false,
-        },
-        {
-          name: ["-n", "--dry-run"],
-          description:
-            "Don't actually run the tasks(s), just print them in order of execution",
-          isRepeatable: false,
-        },
-        {
           name: ["-f", "--force"],
           description: "Force the tasks to run even if outputs are up to date",
           isRepeatable: false,
-        },
-        {
-          name: ["-s", "--shell"],
-          description: "Shell to use to run toml tasks",
-          isRepeatable: false,
-          args: {
-            name: "shell",
-          },
-        },
-        {
-          name: ["-t", "--tool"],
-          description:
-            "Tool(s) to run in addition to what is in mise.toml files e.g.: node@20 python@3.10",
-          isRepeatable: true,
-          args: {
-            name: "tool@version",
-            generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
-          },
         },
         {
           name: ["-j", "--jobs"],
@@ -1688,32 +1993,9 @@ esac`),
           },
         },
         {
-          name: ["-r", "--raw"],
+          name: ["-n", "--dry-run"],
           description:
-            "Read/write directly to stdin/stdout/stderr instead of by line\nRedactions are not applied with this option\nConfigure with `raw` config or `MISE_RAW` env var",
-          isRepeatable: false,
-        },
-        {
-          name: ["-S", "--silent"],
-          description: "Don't show any output except for errors",
-          isRepeatable: false,
-        },
-        {
-          name: "--timeout",
-          description: "Timeout for the task to complete\ne.g.: 30s, 5m",
-          isRepeatable: false,
-          args: {
-            name: "timeout",
-          },
-        },
-        {
-          name: "--no-timings",
-          description: "Hides elapsed time after each task completes",
-          isRepeatable: false,
-        },
-        {
-          name: ["-q", "--quiet"],
-          description: "Don't show extra output",
+            "Don't actually run the task(s), just print them in order of execution",
           isRepeatable: false,
         },
         {
@@ -1723,6 +2005,69 @@ esac`),
           isRepeatable: false,
           args: {
             name: "output",
+          },
+        },
+        {
+          name: ["-q", "--quiet"],
+          description: "Don't show extra output",
+          isRepeatable: false,
+        },
+        {
+          name: ["-r", "--raw"],
+          description:
+            "Read/write directly to stdin/stdout/stderr instead of by line\nRedactions are not applied with this option\nConfigure with `raw` config or `MISE_RAW` env var",
+          isRepeatable: false,
+        },
+        {
+          name: ["-s", "--shell"],
+          description: "Shell to use to run toml tasks",
+          isRepeatable: false,
+          args: {
+            name: "shell",
+          },
+        },
+        {
+          name: ["-S", "--silent"],
+          description: "Don't show any output except for errors",
+          isRepeatable: false,
+        },
+        {
+          name: ["-t", "--tool"],
+          description:
+            "Tool(s) to run in addition to what is in mise.toml files e.g.: node@20 python@3.10",
+          isRepeatable: true,
+          args: {
+            name: "tool@version",
+            generators: toolVersionGenerator,
+            debounce: true,
+          },
+        },
+        {
+          name: "--no-cache",
+          description: "Do not use cache on remote tasks",
+          isRepeatable: false,
+        },
+        {
+          name: "--no-prepare",
+          description: "Skip automatic dependency preparation",
+          isRepeatable: false,
+        },
+        {
+          name: "--no-timings",
+          description: "Hides elapsed time after each task completes",
+          isRepeatable: false,
+        },
+        {
+          name: "--skip-deps",
+          description: "Run only the specified tasks skipping all dependencies",
+          isRepeatable: false,
+        },
+        {
+          name: "--timeout",
+          description: "Timeout for the task to complete\ne.g.: 30s, 5m",
+          isRepeatable: false,
+          args: {
+            name: "timeout",
           },
         },
       ],
@@ -1769,13 +2114,13 @@ esac`),
           isRepeatable: false,
         },
         {
-          name: "--no-plugins",
-          description: "Disable auto-updating plugins",
+          name: ["-y", "--yes"],
+          description: "Skip confirmation prompt",
           isRepeatable: false,
         },
         {
-          name: ["-y", "--yes"],
-          description: "Skip confirmation prompt",
+          name: "--no-plugins",
+          description: "Disable auto-updating plugins",
           isRepeatable: false,
         },
       ],
@@ -1790,20 +2135,6 @@ esac`),
       description: "Set environment variables in mise.toml",
       options: [
         {
-          name: "--file",
-          description: "The TOML file to update",
-          isRepeatable: false,
-          args: {
-            name: "file",
-            template: "filepaths",
-          },
-        },
-        {
-          name: ["-g", "--global"],
-          description: "Set the environment variable in the global config file",
-          isRepeatable: false,
-        },
-        {
           name: ["-E", "--env"],
           description:
             "Create/modify an environment-specific config file like .mise.<env>.toml",
@@ -1813,8 +2144,8 @@ esac`),
           },
         },
         {
-          name: "--prompt",
-          description: "Prompt for environment variable values",
+          name: ["-g", "--global"],
+          description: "Set the environment variable in the global config file",
           isRepeatable: false,
         },
         {
@@ -1822,6 +2153,15 @@ esac`),
           description:
             "[experimental] Encrypt the value with age before storing",
           isRepeatable: false,
+        },
+        {
+          name: "--age-key-file",
+          description: "[experimental] Age identity file for encryption",
+          isRepeatable: false,
+          args: {
+            name: "path",
+            template: "filepaths",
+          },
         },
         {
           name: "--age-recipient",
@@ -1843,13 +2183,18 @@ esac`),
           },
         },
         {
-          name: "--age-key-file",
-          description: "[experimental] Age identity file for encryption",
+          name: "--file",
+          description: "The TOML file to update",
           isRepeatable: false,
           args: {
-            name: "path",
+            name: "file",
             template: "filepaths",
           },
+        },
+        {
+          name: "--prompt",
+          description: "Prompt for environment variable values",
+          isRepeatable: false,
         },
       ],
       args: {
@@ -1881,9 +2226,8 @@ esac`),
             {
               name: "setting",
               description: "The setting to set",
-              generators: completionGeneratorTemplate(
-                `mise settings --complete`
-              ),
+              generators: settingsGenerator,
+              debounce: true,
             },
             {
               name: "value",
@@ -1905,7 +2249,8 @@ esac`),
           args: {
             name: "setting",
             description: "The setting to show",
-            generators: completionGeneratorTemplate(`mise settings --complete`),
+            generators: settingsGenerator,
+            debounce: true,
           },
         },
         {
@@ -1918,19 +2263,14 @@ esac`),
               isRepeatable: false,
             },
             {
-              name: ["-l", "--local"],
-              description:
-                "Use the local config file instead of the global one",
-              isRepeatable: false,
-            },
-            {
               name: ["-J", "--json"],
               description: "Output in JSON format",
               isRepeatable: false,
             },
             {
-              name: "--json-extended",
-              description: "Output in JSON format with sources",
+              name: ["-l", "--local"],
+              description:
+                "Use the local config file instead of the global one",
               isRepeatable: false,
             },
             {
@@ -1938,12 +2278,18 @@ esac`),
               description: "Output in TOML format",
               isRepeatable: false,
             },
+            {
+              name: "--json-extended",
+              description: "Output in JSON format with sources",
+              isRepeatable: false,
+            },
           ],
           args: {
             name: "setting",
             description: "Name of setting",
             isOptional: true,
-            generators: completionGeneratorTemplate(`mise settings --complete`),
+            generators: settingsGenerator,
+            debounce: true,
           },
         },
         {
@@ -1961,9 +2307,8 @@ esac`),
             {
               name: "setting",
               description: "The setting to set",
-              generators: completionGeneratorTemplate(
-                `mise settings --complete`
-              ),
+              generators: settingsGenerator,
+              debounce: true,
             },
             {
               name: "value",
@@ -1995,23 +2340,23 @@ esac`),
           isRepeatable: false,
         },
         {
-          name: ["-l", "--local"],
-          description: "Use the local config file instead of the global one",
-          isRepeatable: false,
-        },
-        {
           name: ["-J", "--json"],
           description: "Output in JSON format",
           isRepeatable: false,
         },
         {
-          name: "--json-extended",
-          description: "Output in JSON format with sources",
+          name: ["-l", "--local"],
+          description: "Use the local config file instead of the global one",
           isRepeatable: false,
         },
         {
           name: ["-T", "--toml"],
           description: "Output in TOML format",
+          isRepeatable: false,
+        },
+        {
+          name: "--json-extended",
+          description: "Output in JSON format with sources",
           isRepeatable: false,
         },
       ],
@@ -2020,7 +2365,8 @@ esac`),
           name: "setting",
           description: "Name of setting",
           isOptional: true,
-          generators: completionGeneratorTemplate(`mise settings --complete`),
+          generators: settingsGenerator,
+          debounce: true,
         },
         {
           name: "value",
@@ -2042,14 +2388,14 @@ esac`),
           },
         },
         {
-          name: "--raw",
-          description:
-            "Directly pipe stdin/stdout/stderr from plugin to user Sets --jobs=1",
+          name: ["-u", "--unset"],
+          description: "Removes a previously set version",
           isRepeatable: false,
         },
         {
-          name: ["-u", "--unset"],
-          description: "Removes a previously set version",
+          name: "--raw",
+          description:
+            "Directly pipe stdin/stdout/stderr from plugin to user Sets --jobs=1",
           isRepeatable: false,
         },
       ],
@@ -2057,26 +2403,69 @@ esac`),
         name: "tool@version",
         description: "Tool(s) to use",
         isVariadic: true,
-        generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+        generators: toolVersionGenerator,
+        debounce: true,
       },
+    },
+    {
+      name: "shell-alias",
+      description: "Manage shell aliases.",
+      subcommands: [
+        {
+          name: "get",
+          description: "Show the command for a shell alias",
+          args: {
+            name: "shell_alias",
+            description: "The alias to show",
+            generators: shellAliasGenerator,
+            debounce: true,
+          },
+        },
+        {
+          name: ["ls", "list"],
+          description: "List shell aliases",
+          options: [
+            {
+              name: "--no-header",
+              description: "Don't show table header",
+              isRepeatable: false,
+            },
+          ],
+        },
+        {
+          name: ["set", "add", "create"],
+          description: "Add/update a shell alias",
+          args: [
+            {
+              name: "shell_alias",
+              description: "The alias name",
+              generators: shellAliasGenerator,
+              debounce: true,
+            },
+            {
+              name: "command",
+              description: "The command to run",
+            },
+          ],
+        },
+        {
+          name: ["unset", "rm", "remove", "delete", "del"],
+          description: "Removes a shell alias",
+          args: {
+            name: "shell_alias",
+            description: "The alias to remove",
+            generators: shellAliasGenerator,
+            debounce: true,
+          },
+        },
+      ],
+      options: [
+        {
+          name: "--no-header",
+          description: "Don't show table header",
+          isRepeatable: false,
+        },
+      ],
     },
     {
       name: "sync",
@@ -2093,13 +2482,13 @@ esac`),
               isRepeatable: false,
             },
             {
-              name: "--nvm",
-              description: "Get tool versions from nvm",
+              name: "--nodenv",
+              description: "Get tool versions from nodenv",
               isRepeatable: false,
             },
             {
-              name: "--nodenv",
-              description: "Get tool versions from nodenv",
+              name: "--nvm",
+              description: "Get tool versions from nvm",
               isRepeatable: false,
             },
           ],
@@ -2144,39 +2533,21 @@ esac`),
           description: "Create a new task",
           options: [
             {
-              name: "--description",
-              description: "Description of the task",
-              isRepeatable: false,
-              args: {
-                name: "description",
-              },
-            },
-            {
               name: ["-a", "--alias"],
               description: "Other names for the task",
               isRepeatable: true,
               args: {
                 name: "alias",
-                generators: completionGeneratorTemplate(
-                  `mise alias ls {{words[PREV]}} | awk '{print $2}'`
-                ),
+                generators: aliasGenerator,
+                debounce: true,
               },
             },
             {
-              name: "--depends-post",
-              description: "Dependencies to run after the task runs",
+              name: ["-d", "--depends"],
+              description: "Add dependencies to the task",
               isRepeatable: true,
               args: {
-                name: "depends_post",
-              },
-            },
-            {
-              name: ["-w", "--wait-for"],
-              description:
-                "Wait for these tasks to complete if they are to run",
-              isRepeatable: true,
-              args: {
-                name: "wait_for",
+                name: "depends",
               },
             },
             {
@@ -2189,8 +2560,18 @@ esac`),
               },
             },
             {
+              name: ["-f", "--file"],
+              description: "Create a file task instead of a toml task",
+              isRepeatable: false,
+            },
+            {
               name: ["-H", "--hide"],
-              description: "Hide the task from `mise task` and completions",
+              description: "Hide the task from `mise tasks` and completions",
+              isRepeatable: false,
+            },
+            {
+              name: ["-q", "--quiet"],
+              description: "Do not print the command before running",
               isRepeatable: false,
             },
             {
@@ -2207,38 +2588,37 @@ esac`),
               },
             },
             {
+              name: ["-w", "--wait-for"],
+              description:
+                "Wait for these tasks to complete if they are to run",
+              isRepeatable: true,
+              args: {
+                name: "wait_for",
+              },
+            },
+            {
+              name: "--depends-post",
+              description: "Dependencies to run after the task runs",
+              isRepeatable: true,
+              args: {
+                name: "depends_post",
+              },
+            },
+            {
+              name: "--description",
+              description: "Description of the task",
+              isRepeatable: false,
+              args: {
+                name: "description",
+              },
+            },
+            {
               name: "--outputs",
               description:
                 "Glob patterns of files this task creates, to skip if they are not modified",
               isRepeatable: true,
               args: {
                 name: "outputs",
-              },
-            },
-            {
-              name: "--shell",
-              description: "Run the task in a specific shell",
-              isRepeatable: false,
-              args: {
-                name: "shell",
-              },
-            },
-            {
-              name: ["-q", "--quiet"],
-              description: "Do not print the command before running",
-              isRepeatable: false,
-            },
-            {
-              name: "--silent",
-              description: "Do not print the command or its output",
-              isRepeatable: false,
-            },
-            {
-              name: ["-d", "--depends"],
-              description: "Add dependencies to the task",
-              isRepeatable: true,
-              args: {
-                name: "depends",
               },
             },
             {
@@ -2250,8 +2630,16 @@ esac`),
               },
             },
             {
-              name: ["-f", "--file"],
-              description: "Create a file task instead of a toml task",
+              name: "--shell",
+              description: "Run the task in a specific shell",
+              isRepeatable: false,
+              args: {
+                name: "shell",
+              },
+            },
+            {
+              name: "--silent",
+              description: "Do not print the command or its output",
               isRepeatable: false,
             },
           ],
@@ -2259,9 +2647,8 @@ esac`),
             {
               name: "task",
               description: "Tasks name to add",
-              generators: completionGeneratorTemplate(
-                `mise tasks ls --complete`
-              ),
+              generators: simpleTaskGenerator,
+              debounce: true,
             },
             {
               name: "run",
@@ -2275,13 +2662,13 @@ esac`),
           description: "Display a tree visualization of a dependency graph",
           options: [
             {
-              name: "--hidden",
-              description: "Show hidden tasks",
+              name: "--dot",
+              description: "Display dependencies in DOT format",
               isRepeatable: false,
             },
             {
-              name: "--dot",
-              description: "Display dependencies in DOT format",
+              name: "--hidden",
+              description: "Show hidden tasks",
               isRepeatable: false,
             },
           ],
@@ -2291,23 +2678,25 @@ esac`),
               "Tasks to show dependencies for\nCan specify multiple tasks by separating with spaces\ne.g.: mise tasks deps lint test check",
             isOptional: true,
             isVariadic: true,
+            generators: simpleTaskGenerator,
+            debounce: true,
           },
         },
         {
           name: "edit",
-          description: "Edit a tasks with $EDITOR",
+          description: "Edit a task with $EDITOR",
           options: [
             {
               name: ["-p", "--path"],
-              description:
-                "Display the path to the tasks instead of editing it",
+              description: "Display the path to the task instead of editing it",
               isRepeatable: false,
             },
           ],
           args: {
             name: "task",
-            description: "Tasks to edit",
-            generators: completionGeneratorTemplate(`mise tasks ls --complete`),
+            description: "Task to edit",
+            generators: simpleTaskGenerator,
+            debounce: true,
           },
         },
         {
@@ -2323,7 +2712,8 @@ esac`),
           args: {
             name: "task",
             description: "Name of the task to get information about",
-            generators: completionGeneratorTemplate(`mise tasks ls --complete`),
+            generators: simpleTaskGenerator,
+            debounce: true,
           },
         },
         {
@@ -2331,21 +2721,6 @@ esac`),
           description:
             "List available tasks to execute\nThese may be included from the config file or from the project's .mise/tasks directory\nmise will merge all tasks from all parent directories into this list.",
           options: [
-            {
-              name: ["-x", "--extended"],
-              description: "Show all columns",
-              isRepeatable: false,
-            },
-            {
-              name: "--no-header",
-              description: "Do not print table header",
-              isRepeatable: false,
-            },
-            {
-              name: "--hidden",
-              description: "Show hidden tasks",
-              isRepeatable: false,
-            },
             {
               name: ["-g", "--global"],
               description: "Only show global tasks",
@@ -2362,9 +2737,24 @@ esac`),
               isRepeatable: false,
             },
             {
+              name: ["-x", "--extended"],
+              description: "Show all columns",
+              isRepeatable: false,
+            },
+            {
               name: "--all",
               description:
                 "Load all tasks from the entire monorepo, including sibling directories.\nBy default, only tasks from the current directory hierarchy are loaded.",
+              isRepeatable: false,
+            },
+            {
+              name: "--hidden",
+              description: "Show hidden tasks",
+              isRepeatable: false,
+            },
+            {
+              name: "--no-header",
+              description: "Do not print table header",
               isRepeatable: false,
             },
             {
@@ -2392,8 +2782,8 @@ esac`),
           description: "Run task(s)",
           options: [
             {
-              name: "--no-cache",
-              description: "Do not use cache on remote tasks",
+              name: ["-c", "--continue-on-error"],
+              description: "Continue running tasks even if one fails",
               isRepeatable: false,
             },
             {
@@ -2406,58 +2796,10 @@ esac`),
               },
             },
             {
-              name: ["-c", "--continue-on-error"],
-              description: "Continue running tasks even if one fails",
-              isRepeatable: false,
-            },
-            {
-              name: ["-n", "--dry-run"],
-              description:
-                "Don't actually run the tasks(s), just print them in order of execution",
-              isRepeatable: false,
-            },
-            {
               name: ["-f", "--force"],
               description:
                 "Force the tasks to run even if outputs are up to date",
               isRepeatable: false,
-            },
-            {
-              name: ["-s", "--shell"],
-              description: "Shell to use to run toml tasks",
-              isRepeatable: false,
-              args: {
-                name: "shell",
-              },
-            },
-            {
-              name: ["-t", "--tool"],
-              description:
-                "Tool(s) to run in addition to what is in mise.toml files e.g.: node@20 python@3.10",
-              isRepeatable: true,
-              args: {
-                name: "tool@version",
-                generators:
-                  completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
-              },
             },
             {
               name: ["-j", "--jobs"],
@@ -2469,32 +2811,9 @@ esac`),
               },
             },
             {
-              name: ["-r", "--raw"],
+              name: ["-n", "--dry-run"],
               description:
-                "Read/write directly to stdin/stdout/stderr instead of by line\nRedactions are not applied with this option\nConfigure with `raw` config or `MISE_RAW` env var",
-              isRepeatable: false,
-            },
-            {
-              name: ["-S", "--silent"],
-              description: "Don't show any output except for errors",
-              isRepeatable: false,
-            },
-            {
-              name: "--timeout",
-              description: "Timeout for the task to complete\ne.g.: 30s, 5m",
-              isRepeatable: false,
-              args: {
-                name: "timeout",
-              },
-            },
-            {
-              name: "--no-timings",
-              description: "Hides elapsed time after each task completes",
-              isRepeatable: false,
-            },
-            {
-              name: ["-q", "--quiet"],
-              description: "Don't show extra output",
+                "Don't actually run the task(s), just print them in order of execution",
               isRepeatable: false,
             },
             {
@@ -2506,6 +2825,70 @@ esac`),
                 name: "output",
               },
             },
+            {
+              name: ["-q", "--quiet"],
+              description: "Don't show extra output",
+              isRepeatable: false,
+            },
+            {
+              name: ["-r", "--raw"],
+              description:
+                "Read/write directly to stdin/stdout/stderr instead of by line\nRedactions are not applied with this option\nConfigure with `raw` config or `MISE_RAW` env var",
+              isRepeatable: false,
+            },
+            {
+              name: ["-s", "--shell"],
+              description: "Shell to use to run toml tasks",
+              isRepeatable: false,
+              args: {
+                name: "shell",
+              },
+            },
+            {
+              name: ["-S", "--silent"],
+              description: "Don't show any output except for errors",
+              isRepeatable: false,
+            },
+            {
+              name: ["-t", "--tool"],
+              description:
+                "Tool(s) to run in addition to what is in mise.toml files e.g.: node@20 python@3.10",
+              isRepeatable: true,
+              args: {
+                name: "tool@version",
+                generators: toolVersionGenerator,
+                debounce: true,
+              },
+            },
+            {
+              name: "--no-cache",
+              description: "Do not use cache on remote tasks",
+              isRepeatable: false,
+            },
+            {
+              name: "--no-prepare",
+              description: "Skip automatic dependency preparation",
+              isRepeatable: false,
+            },
+            {
+              name: "--no-timings",
+              description: "Hides elapsed time after each task completes",
+              isRepeatable: false,
+            },
+            {
+              name: "--skip-deps",
+              description:
+                "Run only the specified tasks skipping all dependencies",
+              isRepeatable: false,
+            },
+            {
+              name: "--timeout",
+              description: "Timeout for the task to complete\ne.g.: 30s, 5m",
+              isRepeatable: false,
+              args: {
+                name: "timeout",
+              },
+            },
           ],
           args: [
             {
@@ -2513,9 +2896,8 @@ esac`),
               description:
                 "Tasks to run\nCan specify multiple tasks by separating with `:::`\ne.g.: mise run task1 arg1 arg2 ::: task2 arg1 arg2",
               isOptional: true,
-              generators: completionGeneratorTemplate(
-                `mise tasks ls --complete`
-              ),
+              generators: simpleTaskGenerator,
+              debounce: true,
             },
             {
               name: "args",
@@ -2528,23 +2910,33 @@ esac`),
           generateSpec: usageGenerateSpec(["mise tasks --usage"]),
           cache: false,
         },
+        {
+          name: "validate",
+          description: "Validate tasks for common errors and issues",
+          options: [
+            {
+              name: "--errors-only",
+              description: "Only show errors (skip warnings)",
+              isRepeatable: false,
+            },
+            {
+              name: "--json",
+              description: "Output validation results in JSON format",
+              isRepeatable: false,
+            },
+          ],
+          args: {
+            name: "tasks",
+            description:
+              "Tasks to validate\nIf not specified, validates all tasks",
+            isOptional: true,
+            isVariadic: true,
+            generators: simpleTaskGenerator,
+            debounce: true,
+          },
+        },
       ],
       options: [
-        {
-          name: ["-x", "--extended"],
-          description: "Show all columns",
-          isRepeatable: false,
-        },
-        {
-          name: "--no-header",
-          description: "Do not print table header",
-          isRepeatable: false,
-        },
-        {
-          name: "--hidden",
-          description: "Show hidden tasks",
-          isRepeatable: false,
-        },
         {
           name: ["-g", "--global"],
           description: "Only show global tasks",
@@ -2561,9 +2953,24 @@ esac`),
           isRepeatable: false,
         },
         {
+          name: ["-x", "--extended"],
+          description: "Show all columns",
+          isRepeatable: false,
+        },
+        {
           name: "--all",
           description:
             "Load all tasks from the entire monorepo, including sibling directories.\nBy default, only tasks from the current directory hierarchy are loaded.",
+          isRepeatable: false,
+        },
+        {
+          name: "--hidden",
+          description: "Show hidden tasks",
+          isRepeatable: false,
+        },
+        {
+          name: "--no-header",
+          description: "Do not print table header",
           isRepeatable: false,
         },
         {
@@ -2589,7 +2996,8 @@ esac`),
         name: "task",
         description: "Task name to get info of",
         isOptional: true,
-        generators: completionGeneratorTemplate(`mise tasks ls --complete`),
+        generators: simpleTaskGenerator,
+        debounce: true,
       },
     },
     {
@@ -2602,6 +3010,14 @@ esac`),
           isRepeatable: false,
         },
         {
+          name: ["-j", "--jobs"],
+          description: "Number of jobs to run in parallel\n[default: 4]",
+          isRepeatable: false,
+          args: {
+            name: "jobs",
+          },
+        },
+        {
           name: "--all-config",
           description: "Test all tools specified in config files",
           isRepeatable: false,
@@ -2611,14 +3027,6 @@ esac`),
           description:
             "Also test tools not defined in registry.toml, guessing how to test it",
           isRepeatable: false,
-        },
-        {
-          name: ["-j", "--jobs"],
-          description: "Number of jobs to run in parallel\n[default: 4]",
-          isRepeatable: false,
-          args: {
-            name: "jobs",
-          },
         },
         {
           name: "--raw",
@@ -2644,8 +3052,18 @@ esac`),
           isRepeatable: false,
         },
         {
+          name: "--active",
+          description: "Only show active versions",
+          isRepeatable: false,
+        },
+        {
           name: "--backend",
           description: "Only show backend field",
+          isRepeatable: false,
+        },
+        {
+          name: "--config-source",
+          description: "Only show config source",
           isRepeatable: false,
         },
         {
@@ -2659,18 +3077,8 @@ esac`),
           isRepeatable: false,
         },
         {
-          name: "--active",
-          description: "Only show active versions",
-          isRepeatable: false,
-        },
-        {
           name: "--requested",
           description: "Only show requested versions",
-          isRepeatable: false,
-        },
-        {
-          name: "--config-source",
-          description: "Only show config source",
           isRepeatable: false,
         },
         {
@@ -2683,6 +3091,7 @@ esac`),
         name: "tool",
         description: "Tool name to get information about",
         generators: completionGeneratorTemplate(`mise registry --complete`),
+        debounce: true,
       },
     },
     {
@@ -2718,14 +3127,14 @@ esac`),
           isRepeatable: false,
         },
         {
-          name: "--untrust",
-          description: "No longer trust this config, will prompt in the future",
-          isRepeatable: false,
-        },
-        {
           name: "--show",
           description:
             "Show the trusted status of config files from the current directory and its parents.\nDoes not trust or untrust any files.",
+          isRepeatable: false,
+        },
+        {
+          name: "--untrust",
+          description: "No longer trust this config, will prompt in the future",
           isRepeatable: false,
         },
       ],
@@ -2734,7 +3143,8 @@ esac`),
         description: "The config file to trust",
         isOptional: true,
         template: "filepaths",
-        generators: completionGeneratorTemplate(``),
+        generators: configPathGenerator,
+        debounce: true,
       },
     },
     {
@@ -2757,28 +3167,8 @@ esac`),
         description: "Tool(s) to remove",
         isOptional: true,
         isVariadic: true,
-        generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    if [ ! -z "$prefix" ]; then
-      prefix="--prefix $prefix"
-    fi
-    versions=$(mise ls --installed $tool $prefix | awk '{print $2}' | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise ls --installed | awk '{print $1}' | sed '1!G;h;$!d')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+        generators: installedToolVersionGenerator,
+        debounce: true,
       },
     },
     {
@@ -2806,18 +3196,13 @@ esac`),
         isOptional: true,
         isVariadic: true,
         generators: completionGeneratorTemplate(`mise set --complete`),
+        debounce: true,
       },
     },
     {
       name: ["unuse", "rm", "remove"],
       description: "Removes installed tool versions from mise.toml",
       options: [
-        {
-          name: ["-g", "--global"],
-          description:
-            "Use the global config file (`~/.config/mise/config.toml`) instead of the local one",
-          isRepeatable: false,
-        },
         {
           name: ["-e", "--env"],
           description:
@@ -2826,6 +3211,12 @@ esac`),
           args: {
             name: "env",
           },
+        },
+        {
+          name: ["-g", "--global"],
+          description:
+            "Use the global config file (`~/.config/mise/config.toml`) instead of the local one",
+          isRepeatable: false,
         },
         {
           name: ["-p", "--path"],
@@ -2846,39 +3237,14 @@ esac`),
         name: "installed_tool@version",
         description: "Tool(s) to remove",
         isVariadic: true,
-        generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    if [ ! -z "$prefix" ]; then
-      prefix="--prefix $prefix"
-    fi
-    versions=$(mise ls --installed $tool $prefix | awk '{print $2}' | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise ls --installed | awk '{print $1}' | sed '1!G;h;$!d')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+        generators: installedToolVersionGenerator,
+        debounce: true,
       },
     },
     {
       name: ["upgrade", "up"],
       description: "Upgrades outdated tools",
       options: [
-        {
-          name: ["-n", "--dry-run"],
-          description: "Just print what would be done, don't actually do it",
-          isRepeatable: false,
-        },
         {
           name: ["-i", "--interactive"],
           description:
@@ -2900,6 +3266,19 @@ esac`),
           isRepeatable: false,
         },
         {
+          name: ["-n", "--dry-run"],
+          description: "Just print what would be done, don't actually do it",
+          isRepeatable: false,
+        },
+        {
+          name: "--before",
+          description: "Only upgrade to versions released before this date",
+          isRepeatable: false,
+          args: {
+            name: "before",
+          },
+        },
+        {
           name: "--raw",
           description:
             "Directly pipe stdin/stdout/stderr from plugin to user Sets --jobs=1",
@@ -2912,53 +3291,14 @@ esac`),
           "Tool(s) to upgrade\ne.g.: node@20 python@3.10\nIf not specified, all current tools will be upgraded",
         isOptional: true,
         isVariadic: true,
-        generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+        generators: toolVersionGenerator,
+        debounce: true,
       },
     },
     {
       name: ["use", "u"],
       description: "Installs a tool and adds the version to mise.toml.",
       options: [
-        {
-          name: ["-f", "--force"],
-          description: "Force reinstall even if already installed",
-          isRepeatable: false,
-        },
-        {
-          name: "--fuzzy",
-          description: "Save fuzzy version to config file",
-          isRepeatable: false,
-        },
-        {
-          name: ["-g", "--global"],
-          description:
-            "Use the global config file (`~/.config/mise/config.toml`) instead of the local one",
-          isRepeatable: false,
-        },
-        {
-          name: ["-n", "--dry-run"],
-          description:
-            "Perform a dry run, showing what would be installed and modified without making changes",
-          isRepeatable: false,
-        },
         {
           name: ["-e", "--env"],
           description:
@@ -2969,12 +3309,57 @@ esac`),
           },
         },
         {
+          name: ["-f", "--force"],
+          description: "Force reinstall even if already installed",
+          isRepeatable: false,
+        },
+        {
+          name: ["-g", "--global"],
+          description:
+            "Use the global config file (`~/.config/mise/config.toml`) instead of the local one",
+          isRepeatable: false,
+        },
+        {
           name: ["-j", "--jobs"],
           description: "Number of jobs to run in parallel\n[default: 4]",
           isRepeatable: false,
           args: {
             name: "jobs",
           },
+        },
+        {
+          name: ["-n", "--dry-run"],
+          description:
+            "Perform a dry run, showing what would be installed and modified without making changes",
+          isRepeatable: false,
+        },
+        {
+          name: ["-p", "--path"],
+          description: "Specify a path to a config file or directory",
+          isRepeatable: false,
+          args: {
+            name: "path",
+            template: "filepaths",
+          },
+        },
+        {
+          name: "--before",
+          description: "Only install versions released before this date",
+          isRepeatable: false,
+          args: {
+            name: "before",
+          },
+        },
+        {
+          name: "--fuzzy",
+          description: "Save fuzzy version to config file",
+          isRepeatable: false,
+        },
+        {
+          name: "--pin",
+          description:
+            "Save exact version to config file\ne.g.: `mise use --pin node@20` will save 20.0.0 as the version\nSet `MISE_PIN=1` to make this the default behavior",
+          isRepeatable: false,
         },
         {
           name: "--raw",
@@ -2988,25 +3373,9 @@ esac`),
           isRepeatable: true,
           args: {
             name: "plugin",
-            generators: completionGeneratorTemplate(
-              `mise plugins --core --user`
-            ),
+            generators: pluginGenerator,
+            debounce: true,
           },
-        },
-        {
-          name: ["-p", "--path"],
-          description: "Specify a path to a config file or directory",
-          isRepeatable: false,
-          args: {
-            name: "path",
-            template: "filepaths",
-          },
-        },
-        {
-          name: "--pin",
-          description:
-            "Save exact version to config file\ne.g.: `mise use --pin node@20` will save 20.0.0 as the version\nSet `MISE_PIN=1` to make this the default behavior",
-          isRepeatable: false,
         },
       ],
       args: {
@@ -3014,25 +3383,8 @@ esac`),
         description: "Tool(s) to add to config file",
         isOptional: true,
         isVariadic: true,
-        generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+        generators: toolVersionGenerator,
+        debounce: true,
       },
     },
     {
@@ -3050,6 +3402,11 @@ esac`),
       name: ["watch", "w"],
       description: "Run task(s) and watch for changes to rerun it",
       options: [
+        {
+          name: "--skip-deps",
+          description: "Run only the specified tasks skipping all dependencies",
+          isRepeatable: false,
+        },
         {
           name: ["-w", "--watch"],
           description: "Watch a specific file or directory",
@@ -3384,7 +3741,8 @@ esac`),
           description:
             "Tasks to run\nCan specify multiple tasks by separating with `:::`\ne.g.: `mise run task1 arg1 arg2 ::: task2 arg1 arg2`",
           isOptional: true,
-          generators: completionGeneratorTemplate(`mise tasks ls --complete`),
+          generators: simpleTaskGenerator,
+          debounce: true,
         },
         {
           name: "args",
@@ -3401,31 +3759,25 @@ esac`),
         name: "tool@version",
         description:
           'Tool(s) to look up\ne.g.: ruby@3\nif "@<PREFIX>" is specified, it will show the latest installed version\nthat matches the prefix\notherwise, it will show the current, active installed version',
-        generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
+        generators: toolVersionGenerator,
+        debounce: true,
       },
     },
     {
       name: "which",
       description: "Shows the path that a tool's bin points to.",
       options: [
+        {
+          name: ["-t", "--tool"],
+          description:
+            "Use a specific tool@version\ne.g.: `mise which npm --tool=node@20`",
+          isRepeatable: false,
+          args: {
+            name: "tool@version",
+            generators: toolVersionGenerator,
+            debounce: true,
+          },
+        },
         {
           name: "--plugin",
           description: "Show the plugin name instead of the path",
@@ -3436,40 +3788,13 @@ esac`),
           description: "Show the version instead of the path",
           isRepeatable: false,
         },
-        {
-          name: ["-t", "--tool"],
-          description:
-            "Use a specific tool@version\ne.g.: `mise which npm --tool=node@20`",
-          isRepeatable: false,
-          args: {
-            name: "tool@version",
-            generators: completionGeneratorTemplate(`cur="{{words[CURRENT]}}"
-case $cur in
-  *@*)
-    tool="$(echo "$cur" | cut -d'@' -f1)"
-    prefix="$(echo "$cur" | cut -d'@' -f2)"
-
-    versions=$(mise ls-remote $tool $prefix | sed '1!G;h;$!d')
-
-    for version in $versions; do
-      echo "$tool@$version"
-    done
-    ;;
-  *)
-    plugins=$(mise registry | awk '{print $1}')
-    for plugin in $plugins; do
-      echo "$plugin@"
-    done
-    ;;
-esac`),
-          },
-        },
       ],
       args: {
         name: "bin_name",
         description: "The bin to look up",
         isOptional: true,
         generators: completionGeneratorTemplate(`mise which --complete`),
+        debounce: true,
       },
     },
   ],
@@ -3500,6 +3825,26 @@ esac`),
       },
     },
     {
+      name: ["-q", "--quiet"],
+      description: "Suppress non-error messages",
+      isRepeatable: false,
+    },
+    {
+      name: ["-v", "--verbose"],
+      description: "Show extra output (use -vv for even more)",
+      isRepeatable: true,
+    },
+    {
+      name: ["-y", "--yes"],
+      description: "Answer yes to all confirmation prompts",
+      isRepeatable: false,
+    },
+    {
+      name: "--no-config",
+      description: "Do not load any config files",
+      isRepeatable: false,
+    },
+    {
       name: "--output",
       isRepeatable: false,
       args: {
@@ -3513,18 +3858,8 @@ esac`),
       isRepeatable: false,
     },
     {
-      name: "--no-config",
-      description: "Do not load any config files",
-      isRepeatable: false,
-    },
-    {
-      name: ["-y", "--yes"],
-      description: "Answer yes to all confirmation prompts",
-      isRepeatable: false,
-    },
-    {
-      name: ["-q", "--quiet"],
-      description: "Suppress non-error messages",
+      name: "--locked",
+      description: "Require lockfile URLs to be present during installation",
       isRepeatable: false,
     },
     {
@@ -3532,18 +3867,13 @@ esac`),
       description: "Suppress all task output and mise non-error messages",
       isRepeatable: false,
     },
-    {
-      name: ["-v", "--verbose"],
-      description: "Show extra output (use -vv for even more)",
-      isRepeatable: true,
-    },
   ],
   args: {
     name: "task",
     description: "Task to run",
     isOptional: true,
-    generators: completionGeneratorTemplate(`mise tasks ls --complete`),
+    generators: simpleTaskGenerator,
+    debounce: true,
   },
 };
-
 export default completionSpec;

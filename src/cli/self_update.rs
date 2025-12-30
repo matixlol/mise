@@ -6,7 +6,7 @@ use self_update::{Status, cargo_crate_version};
 
 use crate::cli::version::{ARCH, OS};
 use crate::config::Settings;
-use crate::{cmd, env};
+use crate::env;
 use std::collections::BTreeMap;
 use std::fs;
 #[cfg(target_os = "macos")]
@@ -33,10 +33,10 @@ fn read_instructions_file(path: &PathBuf) -> Option<String> {
 }
 
 pub fn upgrade_instructions_text() -> Option<String> {
-    if let Some(path) = &*env::MISE_SELF_UPDATE_INSTRUCTIONS {
-        if let Some(msg) = read_instructions_file(path) {
-            return Some(msg);
-        }
+    if let Some(path) = &*env::MISE_SELF_UPDATE_INSTRUCTIONS
+        && let Some(msg) = read_instructions_file(path)
+    {
+        return Some(msg);
     }
     None
 }
@@ -63,20 +63,20 @@ pub fn append_self_update_instructions(mut message: String) -> String {
 #[derive(Debug, Default, clap::Args)]
 #[clap(verbatim_doc_comment)]
 pub struct SelfUpdate {
+    /// Update to a specific version
+    version: Option<String>,
+
     /// Update even if already up to date
     #[clap(long, short)]
     force: bool,
-
-    /// Disable auto-updating plugins
-    #[clap(long)]
-    no_plugins: bool,
 
     /// Skip confirmation prompt
     #[clap(long, short)]
     yes: bool,
 
-    /// Update to a specific version
-    version: Option<String>,
+    /// Disable auto-updating plugins
+    #[clap(long)]
+    no_plugins: bool,
 }
 
 impl SelfUpdate {

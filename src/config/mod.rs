@@ -55,6 +55,7 @@ pub struct Config {
     pub vars: IndexMap<String, String>,
     pub tera_ctx: tera::Context,
     pub shorthands: Shorthands,
+    pub shell_aliases: EnvWithSources,
     aliases: AliasMap,
     env: OnceCell<EnvResults>,
     env_with_sources: OnceCell<EnvWithSources>,
@@ -141,6 +142,7 @@ impl Config {
             aliases: Default::default(),
             project_root: Default::default(),
             repo_urls: Default::default(),
+            shell_aliases: Default::default(),
             vars: Default::default(),
             vars_loader: None,
             vars_results: OnceCell::new(),
@@ -159,6 +161,7 @@ impl Config {
             aliases: config.aliases.clone(),
             project_root: config.project_root.clone(),
             repo_urls: config.repo_urls.clone(),
+            shell_aliases: config.shell_aliases.clone(),
             vars: config.vars.clone(),
             vars_loader: None,
             vars_results: OnceCell::new(),
@@ -179,6 +182,7 @@ impl Config {
 
         config.vars = vars;
         config.aliases = load_aliases(&config.config_files)?;
+        config.shell_aliases = load_shell_aliases(&config.config_files)?;
         config.project_root = get_project_root(&config.config_files);
         config.repo_urls = load_plugins(&config.config_files)?;
         measure!("config::load validate", {
@@ -206,10 +210,24 @@ impl Config {
 
         measure!("config::load install_state", {
             for (plugin, url) in &config.repo_urls {
-                let plugin_type = match url.contains("vfox-") {
-                    true => PluginType::Vfox,
-                    false => PluginType::Asdf,
+                // check plugin type, fallback to asdf
+                let (mut plugin_type, has_explicit_prefix) = match plugin {
+                    p if p.starts_with("vfox:") => (PluginType::Vfox, true),
+                    p if p.starts_with("vfox-backend:") => (PluginType::VfoxBackend, true),
+                    p if p.starts_with("asdf:") => (PluginType::Asdf, true),
+                    _ => (PluginType::Asdf, false),
                 };
+                // keep backward compatibility for vfox plugins, but only if no explicit prefix
+                if !has_explicit_prefix && url.contains("vfox-") {
+                    plugin_type = PluginType::Vfox;
+                }
+
+                let plugin = plugin
+                    .strip_prefix("vfox:")
+                    .or_else(|| plugin.strip_prefix("vfox-backend:"))
+                    .or_else(|| plugin.strip_prefix("asdf:"))
+                    .unwrap_or(plugin);
+
                 install_state::add_plugin(plugin, plugin_type).await?;
             }
         });
@@ -275,10 +293,10 @@ impl Config {
     }
 
     pub async fn vars_results(self: &Arc<Self>) -> Result<&EnvResults> {
-        if let Some(loader) = &self.vars_loader {
-            if let Some(results) = loader.vars_results.get() {
-                return Ok(results);
-            }
+        if let Some(loader) = &self.vars_loader
+            && let Some(results) = loader.vars_results.get()
+        {
+            return Ok(results);
         }
         self.vars_results
             .get_or_try_init(|| async move { load_vars(self).await })
@@ -316,6 +334,16 @@ impl Config {
             .unwrap_or(plugin_name.to_string());
         let plugin_name = plugin_name.strip_prefix("asdf:").unwrap_or(&plugin_name);
         let plugin_name = plugin_name.strip_prefix("vfox:").unwrap_or(plugin_name);
+
+        if let Some(url) = self
+            .repo_urls
+            .keys()
+            .find(|k| k.ends_with(&format!(":{plugin_name}")))
+            .and_then(|k| self.repo_urls.get(k))
+        {
+            return Some(url.clone());
+        }
+
         self.shorthands
             .get(plugin_name)
             .map(|full| registry::full_to_url(&full[0]))
@@ -376,10 +404,10 @@ impl Config {
     }
 
     pub async fn resolve_alias(&self, backend: &ABackend, v: &str) -> Result<String> {
-        if let Some(plugin_aliases) = self.all_aliases.get(&backend.ba().short) {
-            if let Some(alias) = plugin_aliases.versions.get(v) {
-                return Ok(alias.clone());
-            }
+        if let Some(plugin_aliases) = self.all_aliases.get(&backend.ba().short)
+            && let Some(alias) = plugin_aliases.versions.get(v)
+        {
+            return Ok(alias.clone());
         }
         if let Some(alias) = backend.get_aliases()?.get(v) {
             return Ok(alias.clone());
@@ -693,12 +721,30 @@ impl Config {
 }
 
 fn configs_at_root<'a>(dir: &Path, config_files: &'a ConfigMap) -> Vec<&'a Arc<dyn ConfigFile>> {
-    DEFAULT_CONFIG_FILENAMES
+    let mut configs: Vec<&'a Arc<dyn ConfigFile>> = DEFAULT_CONFIG_FILENAMES
         .iter()
         .rev()
-        .map(|f| dir.join(f))
-        .filter_map(|f| config_files.get(&f))
-        .collect()
+        .flat_map(|f| {
+            if f.contains('*') {
+                // Handle glob patterns by matching against actual config file paths
+                glob(dir, f)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|path| config_files.get(&path))
+                    .collect::<Vec<_>>()
+            } else {
+                // Handle regular filenames
+                config_files
+                    .get(&dir.join(f))
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            }
+        })
+        .collect();
+    // Remove duplicates while preserving order
+    let mut seen = std::collections::HashSet::new();
+    configs.retain(|cf| seen.insert(cf.get_path().to_path_buf()));
+    configs
 }
 
 fn get_project_root(config_files: &ConfigMap) -> Option<PathBuf> {
@@ -804,6 +850,7 @@ static LOCAL_CONFIG_FILENAMES: Lazy<IndexSet<&'static str>> = Lazy::new(|| {
             ".config/mise/mise.local.toml",
             ".config/mise.local.toml",
             ".mise/config.local.toml",
+            "mise/config.local.toml",
             ".rtx.local.toml",
             "mise.local.toml",
             ".mise.local.toml",
@@ -896,10 +943,10 @@ pub fn config_file_from_dir(p: &Path) -> PathBuf {
         return p.to_path_buf();
     }
     for dir in all_dirs().unwrap_or_default() {
-        if let Some(cf) = self::config_files_in_dir(&dir).last() {
-            if !is_global_config(cf) {
-                return cf.clone();
-            }
+        if let Some(cf) = self::config_files_in_dir(&dir).last()
+            && !is_global_config(cf)
+        {
+            return cf.clone();
         }
     }
     match Settings::get().asdf_compat {
@@ -940,6 +987,9 @@ pub fn load_config_paths(config_filenames: &[String], include_ignored: bool) -> 
         .into_iter()
         .unique_by(|p| file::desymlink_path(p))
         .filter(|p| {
+            if is_default_config_dir_override_filtered(p) {
+                return false;
+            }
             include_ignored
                 || !(config_file::is_ignored(&config_trust_root(p)) || config_file::is_ignored(p))
         })
@@ -984,7 +1034,12 @@ pub fn load_config_hierarchy_from_dir(start_dir: &Path) -> Result<Vec<PathBuf>> 
     let paths = config_files
         .into_iter()
         .unique_by(|p| file::desymlink_path(p))
-        .filter(|p| !(config_file::is_ignored(&config_trust_root(p)) || config_file::is_ignored(p)))
+        .filter(|p| {
+            if is_default_config_dir_override_filtered(p) {
+                return false;
+            }
+            !(config_file::is_ignored(&config_trust_root(p)) || config_file::is_ignored(p))
+        })
         .collect();
 
     Ok(paths)
@@ -992,6 +1047,16 @@ pub fn load_config_hierarchy_from_dir(start_dir: &Path) -> Result<Vec<PathBuf>> 
 
 pub fn is_global_config(path: &Path) -> bool {
     global_config_files().contains(path) || system_config_files().contains(path)
+}
+
+/// Returns true if the path should be filtered out due to MISE_CONFIG_DIR override.
+/// When MISE_CONFIG_DIR is set to a non-default location, this filters out configs
+/// found under the default location (~/.config/mise) during traversal.
+/// See: https://github.com/jdx/mise/discussions/7015
+fn is_default_config_dir_override_filtered(path: &Path) -> bool {
+    *env::MISE_CONFIG_DIR_OVERRIDDEN
+        && !global_config_files().contains(path)
+        && path.starts_with(&*env::MISE_DEFAULT_CONFIG_DIR)
 }
 
 static GLOBAL_CONFIG_FILES: Lazy<Mutex<Option<IndexSet<PathBuf>>>> = Lazy::new(Default::default);
@@ -1047,10 +1112,11 @@ static CONFIG_FILENAMES: Lazy<Vec<String>> = Lazy::new(|| {
 fn config_files_from_dir(dir: &Path) -> IndexSet<PathBuf> {
     let mut files = IndexSet::new();
     for p in file::ls(&dir.join("conf.d")).unwrap_or_default() {
-        if let Some(file_name) = p.file_name().map(|f| f.to_string_lossy().to_string()) {
-            if !file_name.starts_with(".") && file_name.ends_with(".toml") {
-                files.insert(p);
-            }
+        if let Some(file_name) = p.file_name().map(|f| f.to_string_lossy().to_string())
+            && !file_name.starts_with(".")
+            && file_name.ends_with(".toml")
+        {
+            files.insert(p);
         }
     }
     files.extend(CONFIG_FILENAMES.iter().map(|f| dir.join(f)));
@@ -1184,10 +1250,6 @@ async fn load_all_config_files(
         let cf = match parse_config_file(f, idiomatic_filenames).await {
             Ok(cfg) => cfg,
             Err(err) => {
-                if err.to_string().contains("are not trusted.") {
-                    warn!("{err}");
-                    continue;
-                }
                 return Err(err.wrap_err(format!(
                     "error parsing config file: {}",
                     style::ebold(display_path(f))
@@ -1199,10 +1261,10 @@ async fn load_all_config_files(
         }
 
         // Mark monorepo roots so descendant configs are implicitly trusted
-        if cf.experimental_monorepo_root() == Some(true) {
-            if let Err(err) = config_file::mark_as_monorepo_root(f) {
-                warn!("failed to mark monorepo root: {err:#}");
-            }
+        if cf.experimental_monorepo_root() == Some(true)
+            && let Err(err) = config_file::mark_as_monorepo_root(f)
+        {
+            warn!("failed to mark monorepo root: {err:#}");
         }
 
         config_map.insert(f.clone(), cf);
@@ -1223,10 +1285,6 @@ pub async fn load_config_files_from_paths(config_paths: &[PathBuf]) -> Result<Co
         let cf = match parse_config_file(f, &idiomatic_filenames).await {
             Ok(cfg) => cfg,
             Err(err) => {
-                if err.to_string().contains("are not trusted.") {
-                    trace!("skipping untrusted config: {}", display_path(f));
-                    continue;
-                }
                 return Err(err.wrap_err(format!(
                     "error parsing config file: {}",
                     style::ebold(display_path(f))
@@ -1275,6 +1333,21 @@ fn load_aliases(config_files: &ConfigMap) -> Result<AliasMap> {
     trace!("load_aliases: {}", aliases.len());
 
     Ok(aliases)
+}
+
+fn load_shell_aliases(config_files: &ConfigMap) -> Result<EnvWithSources> {
+    let mut shell_aliases: EnvWithSources = EnvWithSources::new();
+
+    // Iterate in reverse order (global -> local) so child directories override parent configs
+    for config_file in config_files.values().rev() {
+        let path = config_file.get_path().to_path_buf();
+        for (name, cmd) in config_file.shell_aliases()? {
+            shell_aliases.insert(name, (cmd, path.clone()));
+        }
+    }
+    trace!("load_shell_aliases: {}", shell_aliases.len());
+
+    Ok(shell_aliases)
 }
 
 fn load_plugins(config_files: &ConfigMap) -> Result<HashMap<String, String>> {
@@ -1341,11 +1414,11 @@ impl Debug for Config {
                 &tasks.values().map(|t| t.to_string()).collect_vec(),
             );
         }
-        if let Some(env) = self.env_maybe() {
-            if !env.is_empty() {
-                s.field("Env", &env);
-                // s.field("Env Sources", &self.env_sources);
-            }
+        if let Some(env) = self.env_maybe()
+            && !env.is_empty()
+        {
+            s.field("Env", &env);
+            // s.field("Env Sources", &self.env_sources);
         }
         if let Some(env_results) = self.env.get() {
             if !env_results.env_files.is_empty() {
@@ -1471,9 +1544,11 @@ async fn load_local_tasks_with_context(
                 async move {
                     let mut all_tasks = Vec::new();
                     // Load config files from subdirectory
+                    let mut found_config = false;
                     for config_filename in DEFAULT_CONFIG_FILENAMES.iter() {
                         let config_path = subdir.join(config_filename);
                         if config_path.exists() {
+                            found_config = true;
                             match config_file::parse(&config_path).await {
                                 Ok(cf) => {
                                     let mut subdir_tasks =
@@ -1501,6 +1576,17 @@ async fn load_local_tasks_with_context(
                             }
                         }
                     }
+
+                    // If no config file exists, still load default task include dirs
+                    if !found_config {
+                        let includes = task_includes_for_dir(&subdir, &config.config_files);
+                        for include in includes {
+                            let mut subdir_tasks =
+                                load_tasks_includes(&config, &include, &subdir).await?;
+                            prefix_monorepo_task_names(&mut subdir_tasks, &subdir, &monorepo_root);
+                            all_tasks.extend(subdir_tasks);
+                        }
+                    }
                     Ok::<Vec<Task>, eyre::Report>(all_tasks)
                 }
             })
@@ -1526,6 +1612,11 @@ fn discover_monorepo_subdirs(
     ctx: Option<&crate::task::TaskLoadContext>,
 ) -> Result<Vec<PathBuf>> {
     const DEFAULT_IGNORED_DIRS: &[&str] = &["node_modules", "target", "dist", "build"];
+    let has_task_includes = |dir: &Path| {
+        default_task_includes()
+            .into_iter()
+            .any(|include| dir.join(include).exists())
+    };
 
     let mut subdirs = Vec::new();
     let settings = Settings::get();
@@ -1576,7 +1667,8 @@ fn discover_monorepo_subdirs(
                 let has_config = DEFAULT_CONFIG_FILENAMES
                     .iter()
                     .any(|f| dir.join(f).exists());
-                if has_config {
+                let has_task_includes = has_task_includes(dir);
+                if has_config || has_task_includes {
                     // Apply context filtering if provided
                     if let Some(ctx) = ctx {
                         let rel_path = dir
@@ -1612,7 +1704,8 @@ fn discover_monorepo_subdirs(
                 let has_config = DEFAULT_CONFIG_FILENAMES
                     .iter()
                     .any(|f| dir.join(f).exists());
-                if has_config {
+                let has_task_includes = has_task_includes(dir);
+                if has_config || has_task_includes {
                     // Apply context filtering if provided
                     if let Some(ctx) = ctx {
                         let rel_path = dir

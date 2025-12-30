@@ -11,15 +11,16 @@ Below is a list of the available backends in mise:
 - [asdf](/dev-tools/backends/asdf) (provide tools through [plugins](/plugins.html))
 - [aqua](/dev-tools/backends/aqua)
 - [cargo](/dev-tools/backends/cargo)
+- [conda](/dev-tools/backends/conda) <Badge type="warning" text="experimental" />
 - [dotnet](/dev-tools/backends/dotnet) <Badge type="warning" text="experimental" />
-- [gem](/dev-tools/backends/gem) <Badge type="warning" text="experimental" />
+- [gem](/dev-tools/backends/gem)
 - [github](/dev-tools/backends/github)
-- [gitlab](/dev-tools/backends/gitlab) <Badge type="warning" text="experimental" />
-- [go](/dev-tools/backends/go) <Badge type="warning" text="experimental" />
+- [gitlab](/dev-tools/backends/gitlab)
+- [go](/dev-tools/backends/go)
 - [http](/dev-tools/backends/http)
 - [npm](/dev-tools/backends/npm)
 - [pipx](/dev-tools/backends/pipx)
 - [spm](/dev-tools/backends/spm) <Badge type="warning" text="experimental" />
 - [ubi](/dev-tools/backends/ubi)
-- [vfox](/dev-tools/backends/vfox) (provide tools through [plugins](/plugins.html)) <Badge type="warning" text="experimental" />
-- [custom backends](/backend-plugin-development) (build your own backend with a plugin which itself provides many tools) <Badge type="warning" text="experimental" />
+- [vfox](/dev-tools/backends/vfox) (provide tools through [plugins](/plugins.html))
+- [custom backends](/backend-plugin-development) (build your own backend with a plugin which itself provides many tools)

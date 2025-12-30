@@ -13,12 +13,57 @@ use itertools::Itertools;
 use serde_derive::{Deserialize, Serialize};
 use std::sync::LazyLock as Lazy;
 
-use crate::config::Config;
+use crate::cli::HookReason;
+use crate::config::{Config, DEFAULT_CONFIG_FILENAMES, Settings};
 use crate::env::PATH_KEY;
 use crate::env_diff::{EnvDiffOperation, EnvDiffPatches, EnvMap};
 use crate::hash::hash_to_str;
 use crate::shell::Shell;
-use crate::{dirs, env, hooks, watch_files};
+use crate::{dirs, duration, env, file, hooks, watch_files};
+
+/// Directory to store per-directory last check timestamps.
+/// Timestamps are stored per-directory (using a hash of CWD) so that
+/// multiple shells in different directories don't interfere with each other.
+static LAST_CHECK_DIR: Lazy<PathBuf> = Lazy::new(|| dirs::STATE.join("hook-env-checks"));
+
+/// Get the path to the last check file for a specific directory.
+fn last_check_file_for_dir(dir: &Path) -> PathBuf {
+    let hash = hash_to_str(&dir.to_string_lossy());
+    LAST_CHECK_DIR.join(hash)
+}
+
+/// Read the last full check timestamp from the state file for the current directory.
+fn read_last_full_check() -> u128 {
+    let Some(cwd) = &*dirs::CWD else {
+        return 0;
+    };
+    std::fs::read_to_string(last_check_file_for_dir(cwd))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Write the last full check timestamp to the state file for the current directory.
+fn write_last_full_check(timestamp: u128) {
+    let Some(cwd) = &*dirs::CWD else {
+        return;
+    };
+    if let Err(e) = file::create_dir_all(&*LAST_CHECK_DIR) {
+        trace!("failed to create last check dir: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::write(last_check_file_for_dir(cwd), timestamp.to_string()) {
+        trace!("failed to write last check file: {e}");
+    }
+}
+
+/// Convert a SystemTime to milliseconds since Unix epoch
+fn mtime_to_millis(mtime: SystemTime) -> u128 {
+    mtime
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
 
 pub static PREV_SESSION: Lazy<HookEnvSession> = Lazy::new(|| {
     env::var("__MISE_SESSION")
@@ -58,19 +103,156 @@ impl From<PathBuf> for WatchFilePattern {
     }
 }
 
-/// this function will early-exit the application if hook-env is being
-/// called and it does not need to be
-pub fn should_exit_early(watch_files: impl IntoIterator<Item = WatchFilePattern>) -> bool {
+/// Fast-path early exit check that can be called BEFORE loading config/tools.
+/// This checks basic conditions using only the previous session data.
+/// Returns true if we can definitely skip hook-env, false if we need to continue.
+pub fn should_exit_early_fast() -> bool {
     let args = env::ARGS.read().unwrap();
     if args.len() < 2 || args[1] != "hook-env" {
         return false;
     }
+    // Can't exit early if no previous session
+    // Check for dir being set as a proxy for "has valid session"
+    // (loaded_configs can be empty if there are no config files)
+    if PREV_SESSION.dir.is_none() {
+        return false;
+    }
+    // Can't exit early if --force flag is present
+    if args.iter().any(|a| a == "--force" || a == "-f") {
+        return false;
+    }
+    // Check if running from precmd for the first time
+    // Handle both "--reason=precmd" and "--reason precmd" forms
+    let is_precmd = args.iter().any(|a| a == "--reason=precmd")
+        || args
+            .windows(2)
+            .any(|w| w[0] == "--reason" && w[1] == "precmd");
+    if is_precmd && !*env::__MISE_ZSH_PRECMD_RUN {
+        return false;
+    }
+
+    // Get settings for cache_ttl and chpwd_only
+    let settings = Settings::get();
+    let cache_ttl_ms = duration::parse_duration(&settings.hook_env.cache_ttl)
+        .map(|d| d.as_millis())
+        .inspect_err(|e| warn!("invalid hook_env.cache_ttl setting: {e}"))
+        .unwrap_or(0);
+
+    // Compute TTL window check only if cache_ttl is enabled (avoid unnecessary file read)
+    let (now, within_ttl_window) = if cache_ttl_ms > 0 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let last_full_check = read_last_full_check();
+        (now, now.saturating_sub(last_full_check) < cache_ttl_ms)
+    } else {
+        (0, false)
+    };
+
+    // Can't exit early if directory changed
+    if dir_change().is_some() {
+        return false;
+    }
+    // Can't exit early if MISE_ env vars changed (cheap in-memory hash comparison)
+    if have_mise_env_vars_been_modified() {
+        return false;
+    }
+
+    // chpwd_only mode: skip on precmd if directory hasn't changed
+    // This significantly reduces stat operations on slow filesystems like NFS
+    // Note: We check this AFTER env var check since that's cheap (no I/O)
+    if settings.hook_env.chpwd_only && is_precmd {
+        trace!("chpwd_only enabled, skipping precmd hook-env");
+        return true;
+    }
+
+    // Cache TTL check: if within the TTL window, skip all stat operations
+    // This is useful for slow filesystems like NFS where stat calls are expensive
+    if within_ttl_window {
+        trace!("within cache TTL, skipping filesystem checks");
+        return true;
+    }
+
+    // Check if any loaded config files have been modified
+    for config_path in &PREV_SESSION.loaded_configs {
+        if let Ok(metadata) = config_path.metadata() {
+            if let Ok(modified) = metadata.modified()
+                && mtime_to_millis(modified) > PREV_SESSION.latest_update
+            {
+                return false;
+            }
+        } else if !config_path.exists() {
+            return false;
+        }
+    }
+    // Check if data dir has been modified (new tools installed, etc.)
+    // Also check if it's been deleted - this requires a full update
+    if !dirs::DATA.exists() {
+        return false;
+    }
+    if let Ok(metadata) = dirs::DATA.metadata()
+        && let Ok(modified) = metadata.modified()
+        && mtime_to_millis(modified) > PREV_SESSION.latest_update
+    {
+        return false;
+    }
+    // Check if any directory in the config search path has been modified
+    // This catches new config files created anywhere in the hierarchy
+    if let Some(cwd) = &*dirs::CWD
+        && let Ok(ancestor_dirs) = file::all_dirs(cwd, &env::MISE_CEILING_PATHS)
+    {
+        // Config subdirectories that might contain config files
+        let config_subdirs = DEFAULT_CONFIG_FILENAMES
+            .iter()
+            .map(|f| Path::new(f).parent().and_then(|p| p.to_str()).unwrap_or(""))
+            .unique()
+            .collect::<Vec<_>>();
+        for dir in ancestor_dirs {
+            for subdir in &config_subdirs {
+                let check_dir = if subdir.is_empty() {
+                    dir.clone()
+                } else {
+                    dir.join(subdir)
+                };
+                if let Ok(metadata) = check_dir.metadata()
+                    && let Ok(modified) = metadata.modified()
+                    && mtime_to_millis(modified) > PREV_SESSION.latest_update
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    // Filesystem checks passed - update the last check timestamp so subsequent
+    // prompts can benefit from the TTL cache without repeating these checks
+    if cache_ttl_ms > 0 {
+        write_last_full_check(now);
+    }
+    true
+}
+
+/// Check if hook-env can exit early after config is loaded.
+/// This is called after the fast-path check and handles cases that need
+/// the full config (watch_files, hook scheduling).
+pub fn should_exit_early(
+    watch_files: impl IntoIterator<Item = WatchFilePattern>,
+    reason: Option<HookReason>,
+) -> bool {
+    // Force hook-env to run at least once from precmd after activation
+    // This catches PATH modifications from shell initialization (e.g., path_helper in zsh)
+    if reason == Some(HookReason::Precmd) && !*env::__MISE_ZSH_PRECMD_RUN {
+        trace!("__MISE_ZSH_PRECMD_RUN=0 and reason=precmd, forcing hook-env to run");
+        return false;
+    }
+    // Schedule hooks on directory change (can't do this in fast-path)
     if dir_change().is_some() {
         hooks::schedule_hook(hooks::Hooks::Cd);
         hooks::schedule_hook(hooks::Hooks::Enter);
         hooks::schedule_hook(hooks::Hooks::Leave);
         return false;
     }
+    // Check full watch_files list from config (may include more than config files)
     let watch_files = match get_watch_files(watch_files) {
         Ok(w) => w,
         Err(e) => {
@@ -110,12 +292,8 @@ fn have_files_been_modified(watch_files: BTreeSet<PathBuf>) -> bool {
     // check the files to see if they've been altered
     let mut modified = false;
     for fp in &watch_files {
-        if let Ok(modtime) = fp.metadata().and_then(|m| m.modified()) {
-            let modtime = modtime
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            if modtime > PREV_SESSION.latest_update {
+        if let Ok(mtime) = fp.metadata().and_then(|m| m.modified()) {
+            if mtime_to_millis(mtime) > PREV_SESSION.latest_update {
                 trace!("file modified: {:?}", fp);
                 modified = true;
                 watch_files::add_modified_file(fp.clone());
@@ -133,10 +311,7 @@ fn have_files_been_modified(watch_files: BTreeSet<PathBuf>) -> bool {
 }
 
 fn have_mise_env_vars_been_modified() -> bool {
-    if get_mise_env_vars_hashed() != PREV_SESSION.env_var_hash {
-        return true;
-    }
-    false
+    get_mise_env_vars_hashed() != PREV_SESSION.env_var_hash
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -145,6 +320,8 @@ pub struct HookEnvSession {
     pub loaded_configs: IndexSet<PathBuf>,
     pub config_paths: IndexSet<PathBuf>,
     pub env: EnvMap,
+    #[serde(default)]
+    pub aliases: indexmap::IndexMap<String, String>,
     dir: Option<PathBuf>,
     env_var_hash: String,
     latest_update: u128,
@@ -168,6 +345,7 @@ pub fn deserialize<T: serde::de::DeserializeOwned>(raw: String) -> Result<T> {
 pub async fn build_session(
     config: &Arc<Config>,
     env: EnvMap,
+    aliases: indexmap::IndexMap<String, String>,
     loaded_tools: IndexSet<String>,
     watch_files: BTreeSet<WatchFilePattern>,
 ) -> Result<HookEnvSession> {
@@ -184,17 +362,30 @@ pub async fn build_session(
         IndexSet::new()
     };
 
+    let loaded_configs: IndexSet<PathBuf> = config.config_files.keys().cloned().collect();
+
+    // Update the last full check timestamp (only if cache_ttl feature is enabled)
+    let settings = Settings::get();
+    if duration::parse_duration(&settings.hook_env.cache_ttl)
+        .map(|d| d.as_millis() > 0)
+        .unwrap_or(false)
+    {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        write_last_full_check(now);
+    }
+
     Ok(HookEnvSession {
         dir: dirs::CWD.clone(),
         env_var_hash: get_mise_env_vars_hashed(),
         env,
-        loaded_configs: config.config_files.keys().cloned().collect(),
+        aliases,
+        loaded_configs,
         loaded_tools,
         config_paths,
-        latest_update: max_modtime
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis(),
+        latest_update: mtime_to_millis(max_modtime),
     })
 }
 
@@ -236,13 +427,125 @@ fn get_mise_env_vars_hashed() -> String {
 
 pub fn clear_old_env(shell: &dyn Shell) -> String {
     let mut patches = env::__MISE_DIFF.reverse().to_patches();
-    if let Some(path) = env::PRISTINE_ENV.deref().get(&*PATH_KEY) {
-        patches.push(EnvDiffOperation::Change(
-            PATH_KEY.to_string(),
-            path.to_string(),
-        ));
+
+    // For fish shell, filter out PATH operations from the reversed diff because
+    // fish has its own PATH management that conflicts with ours.
+    if shell.to_string() == "fish" {
+        patches.retain(|p| match p {
+            EnvDiffOperation::Add(k, _)
+            | EnvDiffOperation::Change(k, _)
+            | EnvDiffOperation::Remove(k) => k != &*PATH_KEY,
+        });
+        // Fish also needs PATH restored during deactivation
+        let new_path = compute_deactivated_path();
+        patches.push(EnvDiffOperation::Change(PATH_KEY.to_string(), new_path));
+    } else {
+        // For non-fish shells, we need to preserve user-added paths while removing mise paths
+        let new_path = compute_deactivated_path();
+        patches.push(EnvDiffOperation::Change(PATH_KEY.to_string(), new_path));
     }
     build_env_commands(shell, &patches)
+}
+
+/// Clear all aliases from the previous session. Called only during deactivation.
+pub fn clear_aliases(shell: &dyn Shell) -> String {
+    let mut output = String::new();
+    for name in PREV_SESSION.aliases.keys() {
+        output.push_str(&shell.unset_alias(name));
+    }
+    output
+}
+
+/// Compute PATH after deactivation, preserving user additions
+fn compute_deactivated_path() -> String {
+    // Get current PATH (may include user additions since last hook-env)
+    let current_path = env::var("PATH").unwrap_or_default();
+
+    // Get the PATH that mise set during the last hook-env
+    let mise_paths = &env::__MISE_DIFF.path;
+
+    // Get pristine PATH (from before mise activation)
+    let pristine_path = env::PRISTINE_ENV
+        .deref()
+        .get(&*PATH_KEY)
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    if current_path.is_empty() || mise_paths.is_empty() {
+        // If no current PATH or no mise PATH, just return pristine
+        return pristine_path;
+    }
+
+    // Parse paths
+    let current_paths: Vec<PathBuf> = env::split_paths(&current_path).collect();
+    let mise_paths_vec = mise_paths.clone();
+
+    // Count occurrences of each path in current_path, mise_paths, and pristine_path
+    let pristine_paths: Vec<PathBuf> = env::split_paths(&pristine_path).collect();
+
+    let mut current_counts: std::collections::HashMap<PathBuf, usize> =
+        std::collections::HashMap::new();
+    for path in &current_paths {
+        *current_counts.entry(path.clone()).or_insert(0) += 1;
+    }
+
+    let mut mise_counts: std::collections::HashMap<PathBuf, usize> =
+        std::collections::HashMap::new();
+    for path in &mise_paths_vec {
+        *mise_counts.entry(path.clone()).or_insert(0) += 1;
+    }
+
+    let mut pristine_counts: std::collections::HashMap<PathBuf, usize> =
+        std::collections::HashMap::new();
+    for path in &pristine_paths {
+        *pristine_counts.entry(path.clone()).or_insert(0) += 1;
+    }
+
+    // Determine how many copies of each path we should keep: user additions plus pristine entries
+    use std::collections::HashMap;
+
+    let mut target_counts: HashMap<PathBuf, usize> = HashMap::new();
+    for (path, current_count) in current_counts.iter() {
+        let removal_count = *mise_counts.get(path).unwrap_or(&0);
+        let pristine_count = *pristine_counts.get(path).unwrap_or(&0);
+        let user_and_pristine = current_count
+            .saturating_sub(removal_count)
+            .max(pristine_count);
+        target_counts.insert(path.clone(), user_and_pristine);
+    }
+
+    for (path, pristine_count) in pristine_counts.iter() {
+        target_counts
+            .entry(path.clone())
+            .and_modify(|count| *count = (*count).max(*pristine_count))
+            .or_insert(*pristine_count);
+    }
+
+    let mut kept_counts: HashMap<PathBuf, usize> = HashMap::new();
+    let mut final_paths: Vec<PathBuf> = Vec::new();
+
+    for path in &current_paths {
+        if let Some(target) = target_counts.get(path) {
+            let kept = kept_counts.entry(path.clone()).or_insert(0);
+            if *kept < *target {
+                final_paths.push(path.clone());
+                *kept += 1;
+            }
+        }
+    }
+
+    for path in pristine_paths {
+        let target = target_counts.get(&path).copied().unwrap_or(0);
+        let kept = kept_counts.entry(path.clone()).or_insert(0);
+        while *kept < target {
+            final_paths.push(path.clone());
+            *kept += 1;
+        }
+    }
+
+    env::join_paths(final_paths.iter())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or(pristine_path)
 }
 
 pub fn build_env_commands(shell: &dyn Shell, patches: &EnvDiffPatches) -> String {
@@ -256,6 +559,42 @@ pub fn build_env_commands(shell: &dyn Shell, patches: &EnvDiffPatches) -> String
             EnvDiffOperation::Remove(k) => {
                 output.push_str(&shell.unset_env(k));
             }
+        }
+    }
+
+    output
+}
+
+/// Build shell alias commands based on the difference between old and new aliases
+pub fn build_alias_commands(
+    shell: &dyn Shell,
+    old_aliases: &indexmap::IndexMap<String, String>,
+    new_aliases: &indexmap::IndexMap<String, String>,
+) -> String {
+    let mut output = String::new();
+
+    // Remove aliases that no longer exist or have changed
+    for (name, old_cmd) in old_aliases {
+        match new_aliases.get(name) {
+            Some(new_cmd) if new_cmd != old_cmd => {
+                // Alias changed, unset then set new
+                output.push_str(&shell.unset_alias(name));
+                output.push_str(&shell.set_alias(name, new_cmd));
+            }
+            None => {
+                // Alias removed
+                output.push_str(&shell.unset_alias(name));
+            }
+            _ => {
+                // Alias unchanged, do nothing
+            }
+        }
+    }
+
+    // Add new aliases
+    for (name, cmd) in new_aliases {
+        if !old_aliases.contains_key(name) {
+            output.push_str(&shell.set_alias(name, cmd));
         }
     }
 

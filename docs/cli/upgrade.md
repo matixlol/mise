@@ -23,10 +23,6 @@ If not specified, all current tools will be upgraded
 
 ## Flags
 
-### `-n --dry-run`
-
-Just print what would be done, don't actually do it
-
 ### `-i --interactive`
 
 Display multiselect menu to choose which tools to upgrade
@@ -45,6 +41,20 @@ this will install 22.1.0 and set `node = "22.1.0"` in your config.
 
 It keeps the same precision as what was there before, so if you instead had `node = "20"`, it
 would change your config to `node = "22"`.
+
+### `-n --dry-run`
+
+Just print what would be done, don't actually do it
+
+### `--before <BEFORE>`
+
+Only upgrade to versions released before this date
+
+Supports absolute dates like "2024-06-01" and relative durations like "90d" or "1y".
+This can be useful for reproducibility or security purposes.
+
+This only affects fuzzy version matches like "20" or "latest".
+Explicitly pinned versions like "22.5.0" are not filtered.
 
 ### `--raw`
 

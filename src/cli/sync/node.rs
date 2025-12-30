@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use eyre::Result;
 use itertools::sorted;
 
-use crate::{backend, cmd, config, dirs, file};
+use crate::{backend, config, dirs, file};
 use crate::{
     config::Config,
     env::{NODENV_ROOT, NVM_DIR},
@@ -28,13 +28,13 @@ pub struct SyncNodeType {
     #[clap(long)]
     brew: bool,
 
-    /// Get tool versions from nvm
-    #[clap(long)]
-    nvm: bool,
-
     /// Get tool versions from nodenv
     #[clap(long)]
     nodenv: bool,
+
+    /// Get tool versions from nvm
+    #[clap(long)]
+    nvm: bool,
 }
 
 impl SyncNode {

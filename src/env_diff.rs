@@ -15,7 +15,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::sync::LazyLock as Lazy;
 
 use crate::env::PATH_KEY;
-use crate::{cmd, file};
+use crate::file;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct EnvDiff {
@@ -115,11 +115,11 @@ impl EnvDiff {
         }
         for (k, v) in additions.clone().iter() {
             let v = normalize_escape_sequences(v);
-            if let Some(orig) = env.get(k) {
-                if &v == orig {
-                    additions.remove(k);
-                    continue;
-                }
+            if let Some(orig) = env.get(k)
+                && &v == orig
+            {
+                additions.remove(k);
+                continue;
             }
             additions.insert(k.into(), v);
         }

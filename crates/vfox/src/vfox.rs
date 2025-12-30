@@ -99,16 +99,24 @@ impl Vfox {
     }
 
     pub fn get_sdk(&self, name: &str) -> Result<Plugin> {
-        Plugin::from_dir(&self.plugin_dir.join(name))
+        Plugin::from_name_or_dir(name, &self.plugin_dir.join(name))
     }
 
     pub fn install_plugin(&self, sdk: &str) -> Result<Plugin> {
+        // Check filesystem first - allows user to override embedded plugins
         let plugin_dir = self.plugin_dir.join(sdk);
-        if !plugin_dir.exists() {
-            let url = registry::sdk_url(sdk).ok_or_else(|| format!("Unknown SDK: {sdk}"))?;
-            return self.install_plugin_from_url(url);
+        if plugin_dir.exists() {
+            return Plugin::from_dir(&plugin_dir);
         }
-        Plugin::from_dir(&plugin_dir)
+
+        // Fall back to embedded plugin if available
+        if let Some(embedded) = crate::embedded_plugins::get_embedded_plugin(sdk) {
+            return Plugin::from_embedded(sdk, embedded);
+        }
+
+        // Otherwise install from registry
+        let url = registry::sdk_url(sdk).ok_or_else(|| format!("Unknown SDK: {sdk}"))?;
+        self.install_plugin_from_url(url)
     }
 
     pub fn install_plugin_from_url(&self, url: &Url) -> Result<Plugin> {
@@ -151,7 +159,7 @@ impl Vfox {
         trace!("{pre_install:?}");
         if let Some(url) = pre_install.url.as_ref().map(|s| Url::from_str(s)) {
             let file = self.download(&url?, &sdk, version).await?;
-            self.verify(&pre_install, &file)?;
+            self.verify(&pre_install, &file).await?;
             self.extract(&file, install_dir)?;
         }
 
@@ -174,11 +182,27 @@ impl Vfox {
         Ok(())
     }
 
+    pub async fn pre_install_for_platform(
+        &self,
+        sdk: &str,
+        version: &str,
+        os: &str,
+        arch: &str,
+    ) -> Result<PreInstall> {
+        let sdk = self.get_sdk(sdk)?;
+        sdk.pre_install_for_platform(version, os, arch).await
+    }
+
     pub async fn metadata(&self, sdk: &str) -> Result<Metadata> {
         self.get_sdk(sdk)?.get_metadata()
     }
 
-    pub async fn env_keys(&self, sdk: &str, version: &str) -> Result<Vec<EnvKey>> {
+    pub async fn env_keys<T: serde::Serialize>(
+        &self,
+        sdk: &str,
+        version: &str,
+        options: T,
+    ) -> Result<Vec<EnvKey>> {
         debug!("Getting env keys for {sdk} version {version}");
         let sdk = self.get_sdk(sdk)?;
         let sdk_info = sdk.sdk_info(
@@ -191,12 +215,16 @@ impl Vfox {
             path: sdk_info.path.clone(),
             sdk_info: BTreeMap::from([(sdk_info.name.clone(), sdk_info.clone())]),
             main: sdk_info,
+            options,
         };
         sdk.env_keys(ctx).await
     }
 
     pub async fn mise_env<T: serde::Serialize>(&self, sdk: &str, opts: T) -> Result<Vec<EnvKey>> {
         let plugin = self.get_sdk(sdk)?;
+        if !plugin.get_metadata()?.hooks.contains("mise_env") {
+            return Ok(vec![]);
+        }
         let ctx = MiseEnvContext {
             args: vec![],
             options: opts,
@@ -247,6 +275,9 @@ impl Vfox {
 
     pub async fn mise_path<T: serde::Serialize>(&self, sdk: &str, opts: T) -> Result<Vec<String>> {
         let plugin = self.get_sdk(sdk)?;
+        if !plugin.get_metadata()?.hooks.contains("mise_path") {
+            return Ok(vec![]);
+        }
         let ctx = MisePathContext {
             args: vec![],
             options: opts,
@@ -279,10 +310,11 @@ impl Vfox {
         let mut file = tokio::fs::File::create(&path).await?;
         let bytes = resp.bytes().await?;
         tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
+        file.sync_all().await?;
         Ok(path)
     }
 
-    fn verify(&self, pre_install: &PreInstall, file: &Path) -> Result<()> {
+    async fn verify(&self, pre_install: &PreInstall, file: &Path) -> Result<()> {
         self.log_emit(format!("Verifying {file:?} checksum"));
         if let Some(sha256) = &pre_install.sha256 {
             xx::hash::ensure_checksum_sha256(file, sha256)?;
@@ -295,6 +327,44 @@ impl Vfox {
         }
         if let Some(_md5) = &pre_install.md5 {
             unimplemented!("md5")
+        }
+        if let Some(attestation) = &pre_install.attestation {
+            self.log_emit(format!("Verify {file:?} attestation"));
+            if let Some(owner) = &attestation.github_owner
+                && let Some(repo) = &attestation.github_repo
+            {
+                let token = std::env::var("MISE_GITHUB_TOKEN")
+                    .or_else(|_| std::env::var("GITHUB_TOKEN"))
+                    .or(Err("GitHub attestation verification requires either the MISE_GITHUB_TOKEN or GITHUB_TOKEN environment variable set"))?;
+                sigstore_verification::verify_github_attestation(
+                    file,
+                    owner.as_str(),
+                    repo.as_str(),
+                    Some(token.as_str()),
+                    attestation.github_signer_workflow.as_deref(),
+                )
+                .await?;
+            }
+
+            if let Some(sig_or_bundle_path) = &attestation.cosign_sig_or_bundle_path {
+                if let Some(public_key_path) = &attestation.cosign_public_key_path {
+                    sigstore_verification::verify_cosign_signature_with_key(
+                        file,
+                        sig_or_bundle_path,
+                        public_key_path,
+                    )
+                    .await?;
+                } else {
+                    sigstore_verification::verify_cosign_signature(file, sig_or_bundle_path)
+                        .await?;
+                }
+            }
+
+            if let Some(provenance_path) = &attestation.slsa_provenance_path {
+                let min_level = attestation.slsa_min_level.unwrap_or(1u8);
+                sigstore_verification::verify_slsa_provenance(file, provenance_path, min_level)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -381,7 +451,14 @@ mod tests {
     async fn test_env_keys() {
         let vfox = Vfox::test();
         // dummy plugin already exists in plugins/dummy, no need to install
-        let keys = vfox.env_keys("dummy", "1.0.0").await.unwrap();
+        let keys = vfox
+            .env_keys(
+                "dummy",
+                "1.0.0",
+                serde_json::Value::Object(Default::default()),
+            )
+            .await
+            .unwrap();
         let output = format!("{keys:?}").replace(
             &vfox.install_dir.to_string_lossy().to_string(),
             "<INSTALL_DIR>",
@@ -420,31 +497,34 @@ mod tests {
         let install_dir = vfox.install_dir.join("cmake").join("3.21.0");
         vfox.install("cmake", "3.21.0", &install_dir).await.unwrap();
         if cfg!(target_os = "linux") {
-            assert!(vfox
-                .install_dir
-                .join("cmake")
-                .join("3.21.0")
-                .join("bin")
-                .join("cmake")
-                .exists());
+            assert!(
+                vfox.install_dir
+                    .join("cmake")
+                    .join("3.21.0")
+                    .join("bin")
+                    .join("cmake")
+                    .exists()
+            );
         } else if cfg!(target_os = "macos") {
-            assert!(vfox
-                .install_dir
-                .join("cmake")
-                .join("3.21.0")
-                .join("CMake.app")
-                .join("Contents")
-                .join("bin")
-                .join("cmake")
-                .exists());
+            assert!(
+                vfox.install_dir
+                    .join("cmake")
+                    .join("3.21.0")
+                    .join("CMake.app")
+                    .join("Contents")
+                    .join("bin")
+                    .join("cmake")
+                    .exists()
+            );
         } else if cfg!(target_os = "windows") {
-            assert!(vfox
-                .install_dir
-                .join("cmake")
-                .join("3.21.0")
-                .join("bin")
-                .join("cmake.exe")
-                .exists());
+            assert!(
+                vfox.install_dir
+                    .join("cmake")
+                    .join("3.21.0")
+                    .join("bin")
+                    .join("cmake.exe")
+                    .exists()
+            );
         }
         vfox.uninstall_plugin("cmake").unwrap();
         assert!(!vfox.plugin_dir.join("cmake").exists());

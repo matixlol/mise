@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::backend::Backend;
+use crate::backend::VersionInfo;
 use crate::build_time::TARGET;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
@@ -10,7 +11,7 @@ use crate::http::HTTP;
 use crate::install_context::InstallContext;
 use crate::toolset::ToolSource::IdiomaticVersionFile;
 use crate::toolset::outdated_info::OutdatedInfo;
-use crate::toolset::{ToolVersion, Toolset};
+use crate::toolset::{ResolveOptions, ToolVersion, Toolset};
 use crate::ui::progress_report::SingleReport;
 use crate::{dirs, env, file, github, plugins};
 use async_trait::async_trait;
@@ -73,23 +74,37 @@ impl Backend for RustPlugin {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
-        let versions = github::list_releases("rust-lang/rust")
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
+        let versions: Vec<VersionInfo> = github::list_releases("rust-lang/rust")
             .await?
             .into_iter()
-            .map(|r| r.tag_name)
+            .map(|r| VersionInfo {
+                release_url: Some(format!("https://releases.rs/docs/{}/", r.tag_name)),
+                version: r.tag_name,
+                created_at: Some(r.created_at),
+            })
             .rev()
-            .chain(vec!["nightly".into(), "beta".into(), "stable".into()])
+            .chain(vec![
+                // Special channels don't have release URLs since they're not actual releases
+                VersionInfo {
+                    version: "nightly".into(),
+                    ..Default::default()
+                },
+                VersionInfo {
+                    version: "beta".into(),
+                    ..Default::default()
+                },
+                VersionInfo {
+                    version: "stable".into(),
+                    ..Default::default()
+                },
+            ])
             .collect();
         Ok(versions)
     }
 
     async fn idiomatic_filenames(&self) -> Result<Vec<String>> {
-        if Settings::get().experimental {
-            Ok(vec!["rust-toolchain.toml".into()])
-        } else {
-            Ok(vec![])
-        }
+        Ok(vec!["rust-toolchain.toml".into()])
     }
 
     async fn parse_idiomatic_file(&self, path: &Path) -> Result<String> {
@@ -177,10 +192,11 @@ impl Backend for RustPlugin {
         config: &Arc<Config>,
         tv: &ToolVersion,
         bump: bool,
+        opts: &ResolveOptions,
     ) -> Result<Option<OutdatedInfo>> {
         let v_re = regex!(r#"Update available : (.*) -> (.*)"#);
         if regex!(r"(\d+)\.(\d+)\.(\d+)").is_match(&tv.version) {
-            let oi = OutdatedInfo::resolve(config, tv.clone(), bump).await?;
+            let oi = OutdatedInfo::resolve(config, tv.clone(), bump, opts).await?;
             Ok(oi)
         } else {
             let ts = config.get_toolset().await?;
@@ -191,13 +207,13 @@ impl Backend for RustPlugin {
             }
             let out = cmd.read()?;
             for line in out.lines() {
-                if line.starts_with(&self.target_triple(tv)) {
-                    if let Some(_cap) = v_re.captures(line) {
-                        // let requested = cap.get(1).unwrap().as_str().to_string();
-                        // let latest = cap.get(2).unwrap().as_str().to_string();
-                        let oi = OutdatedInfo::new(config, tv.clone(), tv.version.clone())?;
-                        return Ok(Some(oi));
-                    }
+                if line.starts_with(&self.target_triple(tv))
+                    && let Some(_cap) = v_re.captures(line)
+                {
+                    // let requested = cap.get(1).unwrap().as_str().to_string();
+                    // let latest = cap.get(2).unwrap().as_str().to_string();
+                    let oi = OutdatedInfo::new(config, tv.clone(), tv.version.clone())?;
+                    return Ok(Some(oi));
                 }
             }
             Ok(None)

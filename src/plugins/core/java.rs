@@ -4,7 +4,7 @@ use std::fs::{self};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, VersionInfo};
 use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::cli::args::BackendArg;
 use crate::cli::version::OS;
@@ -22,6 +22,7 @@ use indoc::formatdoc;
 use itertools::Itertools;
 use regex::Regex;
 use serde_derive::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::LazyLock as Lazy;
 use versions::Versioning;
 use xx::regex;
@@ -295,16 +296,18 @@ impl Backend for JavaPlugin {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
-        // TODO: find out how to get this to work for different os/arch
-        // See https://github.com/jdx/mise/issues/1196
-        // match self.core.fetch_remote_versions_from_mise() {
-        //     Ok(Some(versions)) => return Ok(versions),
-        //     Ok(None) => {}
-        //     Err(e) => warn!("failed to fetch remote versions: {}", e),
-        // }
+    async fn _list_remote_versions(&self, config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
+        let release_type = config
+            .get_tool_request_set()
+            .await?
+            .list_tools()
+            .iter()
+            .find(|ba| ba.short == "java")
+            .and_then(|ba| ba.opts().get("release_type").cloned())
+            .unwrap_or_else(|| "ga".to_string());
+
         let versions = self
-            .fetch_java_metadata("ga")
+            .fetch_java_metadata(&release_type)
             .await?
             .iter()
             .sorted_by_cached_key(|(v, m)| {
@@ -316,20 +319,49 @@ impl Backend for JavaPlugin {
                     .is_some_and(|image_type| image_type == "jdk");
                 let features = 10 - m.features.as_ref().map_or(0, |f| f.len());
                 let version = Versioning::new(v);
+                // Extract build suffix after a '+', '.' if present. If not present, treat as 0.
+                let build_num = v
+                    .rsplit_once('+')
+                    .or_else(|| v.rsplit_once('.'))
+                    .and_then(|(_, tail)| {
+                        // take leading digits of tail
+                        let digits: String =
+                            tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        if digits.is_empty() {
+                            None
+                        } else {
+                            u64::from_str(&digits).ok()
+                        }
+                    })
+                    .unwrap_or(0u64);
                 (
                     is_shorthand,
                     vendor,
                     is_jdk,
                     features,
                     version,
+                    build_num,
                     v.to_string(),
                 )
             })
-            .map(|(v, _)| v.clone())
-            .unique()
+            .map(|(v, m)| VersionInfo {
+                version: v.clone(),
+                created_at: m.created_at.clone(),
+                ..Default::default()
+            })
+            .unique_by(|v| v.version.clone())
             .collect();
 
         Ok(versions)
+    }
+
+    /// Override to bypass the shared remote_versions cache since Java has separate
+    /// caches for GA and EA release types in fetch_java_metadata.
+    async fn list_remote_versions_with_info(
+        &self,
+        config: &Arc<Config>,
+    ) -> Result<Vec<VersionInfo>> {
+        self._list_remote_versions(config).await
     }
 
     fn list_installed_versions_matching(&self, query: &str) -> Vec<String> {
@@ -347,7 +379,7 @@ impl Backend for JavaPlugin {
     }
 
     fn get_aliases(&self) -> Result<BTreeMap<String, String>> {
-        let aliases = BTreeMap::from([("lts".into(), "21".into())]);
+        let aliases = BTreeMap::from([("lts".into(), "25".into())]);
         Ok(aliases)
     }
 
@@ -459,13 +491,21 @@ impl Backend for JavaPlugin {
     }
 
     fn fuzzy_match_filter(&self, versions: Vec<String>, query: &str) -> Vec<String> {
+        let is_vendor_prefix = query != "latest" && query.ends_with('-');
         let query_escaped = regex::escape(query);
         let query = match query {
             "latest" => "[0-9].*",
             // else; use escaped query
             _ => &query_escaped,
         };
-        let query_regex = Regex::new(&format!("^{query}([+-.].+)?$")).unwrap();
+        // Same semantics as Backend::fuzzy_match_filter:
+        // - "1.2" should match "1.2.3" but not "1.20"
+        // - vendor prefixes like "temurin-" should match "temurin-25..."
+        let query_regex = if is_vendor_prefix {
+            Regex::new(&format!("^{query}.*$")).unwrap()
+        } else {
+            Regex::new(&format!("^{query}([+\\-.].+)?$")).unwrap()
+        };
 
         versions
             .into_iter()
@@ -507,6 +547,7 @@ struct JavaMetadata {
     // architecture: String,
     checksum: Option<String>,
     // checksum_url: Option<String>,
+    created_at: Option<String>,
     features: Option<Vec<String>>,
     file_type: Option<String>,
     // filename: String,

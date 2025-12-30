@@ -177,7 +177,9 @@ impl<'a> CmdLineRunner<'a> {
 
     pub fn redact(mut self, redactions: impl IntoIterator<Item = String>) -> Self {
         for r in redactions {
-            self.redactions.insert(r);
+            if !r.is_empty() {
+                self.redactions.insert(r);
+            }
         }
         self
     }
@@ -527,7 +529,7 @@ enum ChildProcessOutput {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::{cmd, config::Config};
+    use crate::config::Config;
 
     #[tokio::test]
     async fn test_cmd() {

@@ -1,20 +1,26 @@
 use crate::backend::backend_type::BackendType;
+use crate::backend::platform_target::PlatformTarget;
+use crate::backend::{Backend, VersionInfo};
 use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings};
+use crate::env;
+use crate::file;
 use crate::github;
 use crate::http::HTTP_FETCH;
 use crate::install_context::InstallContext;
-use crate::toolset::{ToolVersion, ToolVersionOptions, Toolset, ToolsetBuilder};
+use crate::timeout;
+use crate::toolset::{ToolRequest, ToolVersion, ToolVersionOptions, Toolset, ToolsetBuilder};
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
-use crate::{backend::Backend, timeout};
 use async_trait::async_trait;
 use eyre::{Result, eyre};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use regex::Regex;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::{fmt::Debug, sync::Arc};
 use versions::Versioning;
@@ -44,11 +50,7 @@ impl Backend for PIPXBackend {
         Ok(vec!["uv"])
     }
 
-    /*
-     * Pipx doesn't have a remote version concept across its backends, so
-     * we return a single version.
-     */
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<String>> {
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
         match self.tool_name().parse()? {
             PipxRequest::Pypi(package) => {
                 let registry_url = Self::get_registry_url()?;
@@ -56,11 +58,25 @@ impl Backend for PIPXBackend {
                     debug!("Fetching JSON for {}", package);
                     let url = registry_url.replace("{}", &package);
                     let data: PypiPackage = HTTP_FETCH.json(url).await?;
+
+                    // Get versions sorted and attach timestamps from the first file in each release
                     let versions = data
                         .releases
-                        .keys()
-                        .map(|v| v.to_string())
-                        .sorted_by_cached_key(|v| Versioning::new(v))
+                        .into_iter()
+                        .sorted_by_cached_key(|(v, _)| Versioning::new(v))
+                        .map(|(version, files)| {
+                            // Get the earliest upload_time from the release files
+                            let created_at = files
+                                .iter()
+                                .filter_map(|f| f.upload_time.as_ref())
+                                .min()
+                                .cloned();
+                            VersionInfo {
+                                version,
+                                created_at,
+                                ..Default::default()
+                            }
+                        })
                         .collect();
 
                     Ok(versions)
@@ -69,12 +85,12 @@ impl Backend for PIPXBackend {
                     let url = registry_url.replace("{}", &package);
                     let html = HTTP_FETCH.get_html(url).await?;
 
-                    // PEP-0503
+                    // PEP-0503 (HTML format doesn't include timestamps)
                     let version_re = regex!(
                         r#"href=["'][^"']*/([^/]+)\.tar\.gz(?:#(md5|sha1|sha224|sha256|sha384|sha512)=[0-9A-Fa-f]+)?["']"#
                     );
 
-                    let versions: Vec<String> = version_re
+                    let versions: Vec<VersionInfo> = version_re
                         .captures_iter(&html)
                         .filter_map(|cap| {
                             let filename = cap.get(1)?.as_str();
@@ -84,9 +100,12 @@ impl Backend for PIPXBackend {
                             let re_str = format!("^{re_str}-(.+)$");
                             let pkg_re = regex::Regex::new(&re_str).ok()?;
                             let pkg_version = pkg_re.captures(filename)?.get(1)?.as_str();
-                            Some(pkg_version.to_string())
+                            Some(VersionInfo {
+                                version: pkg_version.to_string(),
+                                ..Default::default()
+                            })
                         })
-                        .sorted_by_cached_key(|v| Versioning::new(v))
+                        .sorted_by_cached_key(|v| Versioning::new(&v.version))
                         .collect();
 
                     Ok(versions)
@@ -95,9 +114,20 @@ impl Backend for PIPXBackend {
             PipxRequest::Git(url) if url.starts_with("https://github.com/") => {
                 let repo = url.strip_prefix("https://github.com/").unwrap();
                 let data = github::list_releases(repo).await?;
-                Ok(data.into_iter().rev().map(|r| r.tag_name).collect())
+                Ok(data
+                    .into_iter()
+                    .rev()
+                    .map(|r| VersionInfo {
+                        version: r.tag_name,
+                        created_at: Some(r.created_at),
+                        ..Default::default()
+                    })
+                    .collect())
             }
-            PipxRequest::Git { .. } => Ok(vec!["latest".to_string()]),
+            PipxRequest::Git { .. } => Ok(vec![VersionInfo {
+                version: "latest".to_string(),
+                ..Default::default()
+            }]),
         }
     }
 
@@ -212,8 +242,42 @@ impl Backend for PIPXBackend {
             }
             cmd.execute()?;
         }
+
+        // Fix venv Python symlink to use minor version path
+        // This allows patch upgrades (3.12.1 → 3.12.2) to work without reinstalling
+        let pkg_name = self.tool_name();
+        fix_venv_python_symlink(&tv.install_path(), &pkg_name)?;
+
         Ok(tv)
     }
+
+    fn resolve_lockfile_options(
+        &self,
+        request: &ToolRequest,
+        _target: &PlatformTarget,
+    ) -> BTreeMap<String, String> {
+        let opts = request.options();
+        let mut result = BTreeMap::new();
+
+        // These options affect what gets installed
+        for key in ["extras", "pipx_args", "uvx_args", "uvx"] {
+            if let Some(value) = opts.get(key) {
+                result.insert(key.to_string(), value.clone());
+            }
+        }
+
+        result
+    }
+}
+
+/// Returns install-time-only option keys for PIPX backend.
+pub fn install_time_option_keys() -> Vec<String> {
+    vec![
+        "extras".into(),
+        "pipx_args".into(),
+        "uvx_args".into(),
+        "uvx".into(),
+    ]
 }
 
 impl PIPXBackend {
@@ -407,7 +471,9 @@ struct PypiInfo {
 }
 
 #[derive(serde::Deserialize)]
-struct PypiRelease {}
+struct PypiRelease {
+    upload_time: Option<String>,
+}
 
 impl FromStr for PipxRequest {
     type Err = eyre::Error;
@@ -421,4 +487,103 @@ impl FromStr for PipxRequest {
             Ok(PipxRequest::Pypi(s.to_string()))
         }
     }
+}
+
+/// Check if a path is within mise's Python installs directory
+#[cfg(unix)]
+fn is_mise_managed_python(path: &Path) -> bool {
+    let installs_dir = &*env::MISE_INSTALLS_DIR;
+    path.starts_with(installs_dir.join("python"))
+}
+
+/// Convert a Python path with full version to use minor version
+/// e.g., .../python/3.12.1/bin/python → .../python/3.12/bin/python
+#[cfg(unix)]
+fn path_with_minor_version(path: &Path) -> Option<PathBuf> {
+    let path_str = path.to_str()?;
+
+    // Match pattern: /python/X.Y.Z/ and replace with /python/X.Y/
+    let re = regex!(r"/python/(\d+)\.(\d+)\.\d+/");
+    if re.is_match(path_str) {
+        let result = re.replace(path_str, "/python/$1.$2/");
+        Some(PathBuf::from(result.to_string()))
+    } else {
+        None
+    }
+}
+
+/// Fix the venv Python symlinks to use mise's minor version path
+/// This allows patch upgrades (3.12.1 → 3.12.2) to work without reinstalling
+///
+/// The venv structure typically has:
+/// - python -> python3 (relative symlink)
+/// - python3 -> /path/to/mise/installs/python/3.12.1/bin/python3 (absolute symlink)
+///
+/// We need to fix the absolute symlink to use minor version path (3.12 instead of 3.12.1)
+#[cfg(unix)]
+fn fix_venv_python_symlink(install_path: &Path, pkg_name: &str) -> Result<()> {
+    // For Git-based packages like "psf/black", the venv directory is just "black"
+    // Extract the actual package name (last component after any '/')
+    let actual_pkg_name = pkg_name.rsplit('/').next().unwrap_or(pkg_name);
+
+    // Check both possible venv locations: {pkg}/ for uvx, venvs/{pkg}/ for pipx
+    let venv_dirs = [
+        install_path.join(actual_pkg_name),
+        install_path.join("venvs").join(actual_pkg_name),
+    ];
+
+    trace!(
+        "fix_venv_python_symlink: checking venv dirs: {:?}",
+        venv_dirs
+    );
+
+    for venv_dir in &venv_dirs {
+        let bin_dir = venv_dir.join("bin");
+        if !bin_dir.exists() {
+            continue;
+        }
+
+        // Check python, python3, and python3.X symlinks for the one with absolute mise path
+        for name in &["python", "python3"] {
+            let symlink_path = bin_dir.join(name);
+            if !symlink_path.is_symlink() {
+                continue;
+            }
+
+            let target = match file::resolve_symlink(&symlink_path)? {
+                Some(t) => t,
+                None => continue,
+            };
+
+            // Skip relative symlinks (like python -> python3)
+            if !target.is_absolute() {
+                continue;
+            }
+
+            if !is_mise_managed_python(&target) {
+                continue; // Leave non-mise Python alone (homebrew, uv, etc.)
+            }
+
+            if let Some(minor_path) = path_with_minor_version(&target) {
+                // The minor version symlink (e.g., python/3.12) might not exist yet
+                // as runtime_symlinks::rebuild runs after all tools are installed.
+                // Check if the full version path exists instead (e.g., python/3.12.12/bin/python3).
+                // The symlink might be temporarily broken but will work after runtime symlinks are created.
+                if target.exists() {
+                    trace!(
+                        "Updating venv Python symlink {:?} to use minor version: {:?}",
+                        symlink_path, minor_path
+                    );
+                    file::make_symlink(&minor_path, &symlink_path)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// No-op on non-Unix platforms
+#[cfg(not(unix))]
+fn fix_venv_python_symlink(_install_path: &Path, _pkg_name: &str) -> Result<()> {
+    Ok(())
 }

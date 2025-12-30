@@ -1,12 +1,17 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use eyre::{Report, Result, bail, ensure};
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{ClientBuilder, IntoUrl, Method, Response};
 use std::sync::LazyLock as Lazy;
+use tokio::sync::OnceCell;
 use tokio_retry::Retry;
 use tokio_retry::strategy::{ExponentialBackoff, jitter};
 use url::Url;
@@ -14,6 +19,7 @@ use url::Url;
 use crate::cli::version;
 use crate::config::Settings;
 use crate::file::display_path;
+use crate::netrc;
 use crate::ui::progress_report::SingleReport;
 use crate::ui::time::format_duration;
 use crate::{env, file};
@@ -32,6 +38,14 @@ pub static HTTP_FETCH: Lazy<Client> = Lazy::new(|| {
     )
     .unwrap()
 });
+
+/// In-memory cache for HTTP text responses, useful for requests that are repeated
+/// during a single operation (e.g., fetching SHASUMS256.txt for multiple platforms).
+/// Each URL gets its own OnceCell to ensure concurrent requests for the same URL
+/// wait for the first fetch to complete rather than all fetching simultaneously.
+type CachedResult = Arc<OnceCell<Result<String, String>>>;
+static HTTP_CACHE: Lazy<Mutex<HashMap<String, CachedResult>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug)]
 pub struct Client {
@@ -130,6 +144,39 @@ impl Client {
         Ok(text)
     }
 
+    /// Like get_text but caches results in memory for the duration of the process.
+    /// Useful when the same URL will be requested multiple times (e.g., SHASUMS256.txt
+    /// when locking multiple platforms). Concurrent requests for the same URL will
+    /// wait for the first fetch to complete.
+    pub async fn get_text_cached<U: IntoUrl>(&self, url: U) -> Result<String> {
+        let url = url.into_url().unwrap();
+        let key = url.to_string();
+
+        // Get or create the OnceCell for this URL
+        let cell = {
+            let mut cache = HTTP_CACHE.lock().unwrap();
+            cache.entry(key).or_default().clone()
+        };
+
+        // Initialize the cell if needed - concurrent callers will wait
+        let result = cell
+            .get_or_init(|| {
+                let url = url.clone();
+                async move {
+                    match self.get_text(url).await {
+                        Ok(text) => Ok(text),
+                        Err(err) => Err(err.to_string()),
+                    }
+                }
+            })
+            .await;
+
+        match result {
+            Ok(text) => Ok(text.clone()),
+            Err(err) => bail!("{}", err),
+        }
+    }
+
     pub async fn get_html<U: IntoUrl>(&self, url: U) -> Result<String> {
         let url = url.into_url().unwrap();
         let resp = self.get_async(url.clone()).await?;
@@ -173,6 +220,18 @@ impl Client {
         self.json_headers(url).await.map(|(json, _)| json)
     }
 
+    /// Like json but caches raw JSON text in memory for the duration of the process.
+    /// Useful when the same URL will be requested multiple times (e.g., zig index.json
+    /// when locking multiple platforms). Concurrent requests for the same URL will
+    /// wait for the first fetch to complete.
+    pub async fn json_cached<T, U: IntoUrl>(&self, url: U) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let text = self.get_text_cached(url).await?;
+        Ok(serde_json::from_str(&text)?)
+    }
+
     pub async fn json_with_headers<T, U: IntoUrl>(&self, url: U, headers: &HeaderMap) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
@@ -180,6 +239,26 @@ impl Client {
         self.json_headers_with_headers(url, headers)
             .await
             .map(|(json, _)| json)
+    }
+
+    /// POST JSON data to a URL. Returns Ok(true) on success, Ok(false) on non-success status.
+    /// Errors only on network/connection failures.
+    pub async fn post_json<U: IntoUrl, T: serde::Serialize>(
+        &self,
+        url: U,
+        body: &T,
+    ) -> Result<bool> {
+        ensure!(!*env::OFFLINE, "offline mode is enabled");
+        let url = url.into_url()?;
+        debug!("POST {}", &url);
+        let resp = self
+            .reqwest
+            .post(url)
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await?;
+        Ok(resp.status().is_success())
     }
 
     pub async fn download_file<U: IntoUrl>(
@@ -204,12 +283,12 @@ impl Client {
         let url = url.into_url()?;
         debug!("GET Downloading {} to {}", &url, display_path(path));
         let mut resp = self.get_async_with_headers(url.clone(), headers).await?;
-        if let Some(length) = resp.content_length() {
-            if let Some(pr) = pr {
-                // Reset progress on each attempt
-                pr.set_length(length);
-                pr.set_position(0);
-            }
+        if let Some(length) = resp.content_length()
+            && let Some(pr) = pr
+        {
+            // Reset progress on each attempt
+            pr.set_length(length);
+            pr.set_position(0);
         }
 
         let parent = path.parent().unwrap();
@@ -266,8 +345,13 @@ impl Client {
     ) -> Result<Response> {
         apply_url_replacements(&mut url);
         debug!("{} {}", verb_label, &url);
+
+        // Apply netrc credentials after URL replacement
+        let mut final_headers = headers.clone();
+        final_headers.extend(netrc_headers(&url));
+
         let mut req = self.reqwest.request(method, url.clone());
-        req = req.headers(headers.clone());
+        req = req.headers(final_headers);
         let resp = match req.send().await {
             Ok(resp) => resp,
             Err(err) => {
@@ -324,16 +408,30 @@ pub fn error_code(e: &Report) -> Option<u16> {
 
 fn github_headers(url: &Url) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    if url.host_str() == Some("api.github.com") {
-        if let Some(token) = &*env::GITHUB_TOKEN {
-            headers.insert(
-                "authorization",
-                HeaderValue::from_str(format!("token {token}").as_str()).unwrap(),
-            );
-            headers.insert(
-                "x-github-api-version",
-                HeaderValue::from_static("2022-11-28"),
-            );
+    if url.host_str() == Some("api.github.com")
+        && let Some(token) = &*env::GITHUB_TOKEN
+    {
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(format!("token {token}").as_str()).unwrap(),
+        );
+        headers.insert(
+            "x-github-api-version",
+            HeaderValue::from_static("2022-11-28"),
+        );
+    }
+    headers
+}
+
+/// Get HTTP Basic authentication headers from netrc file for the given URL
+fn netrc_headers(url: &Url) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(host) = url.host_str()
+        && let Some((login, password)) = netrc::get_credentials(host)
+    {
+        let credentials = BASE64_STANDARD.encode(format!("{login}:{password}"));
+        if let Ok(value) = HeaderValue::from_str(&format!("Basic {credentials}")) {
+            headers.insert("authorization", value);
         }
     }
     headers
@@ -352,17 +450,17 @@ pub fn apply_url_replacements(url: &mut Url) {
                 if let Ok(regex) = Regex::new(pattern_without_prefix) {
                     let new_url_string = regex.replace(&url_string, replacement.as_str());
                     // Only proceed if the URL actually changed
-                    if new_url_string != url_string {
-                        if let Ok(new_url) = new_url_string.parse() {
-                            *url = new_url;
-                            trace!(
-                                "Replaced URL using regex '{}': {} -> {}",
-                                pattern_without_prefix,
-                                url_string,
-                                url.as_str()
-                            );
-                            return; // Apply only the first matching replacement
-                        }
+                    if new_url_string != url_string
+                        && let Ok(new_url) = new_url_string.parse()
+                    {
+                        *url = new_url;
+                        trace!(
+                            "Replaced URL using regex '{}': {} -> {}",
+                            pattern_without_prefix,
+                            url_string,
+                            url.as_str()
+                        );
+                        return; // Apply only the first matching replacement
                     }
                 } else {
                     warn!(
@@ -375,17 +473,17 @@ pub fn apply_url_replacements(url: &mut Url) {
                 if url_string.contains(pattern) {
                     let new_url_string = url_string.replace(pattern, replacement);
                     // Only proceed if the URL actually changed
-                    if new_url_string != url_string {
-                        if let Ok(new_url) = new_url_string.parse() {
-                            *url = new_url;
-                            trace!(
-                                "Replaced URL using string replacement '{}': {} -> {}",
-                                pattern,
-                                url_string,
-                                url.as_str()
-                            );
-                            return; // Apply only the first matching replacement
-                        }
+                    if new_url_string != url_string
+                        && let Ok(new_url) = new_url_string.parse()
+                    {
+                        *url = new_url;
+                        trace!(
+                            "Replaced URL using string replacement '{}': {} -> {}",
+                            pattern,
+                            url_string,
+                            url.as_str()
+                        );
+                        return; // Apply only the first matching replacement
                     }
                 }
             }

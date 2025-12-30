@@ -21,29 +21,31 @@ If not specified, all tools in lockfile will be updated
 
 ## Flags
 
+### `-j --jobs <JOBS>`
+
+Number of jobs to run in parallel
+
+### `-n --dry-run`
+
+Show what would be updated without making changes
+
 ### `-p --platform… <PLATFORM>`
 
 Comma-separated list of platforms to target
 e.g.: linux-x64,macos-arm64,windows-x64
 If not specified, all platforms already in lockfile will be updated
 
-### `-f --force`
+### `--local`
 
-Update all tools even if lockfile data already exists
-
-### `-n --dry-run`
-
-Show what would be updated without making changes
-
-### `-j --jobs <JOBS>`
-
-Number of jobs to run in parallel
-[default: 4]
+Update mise.local.lock instead of mise.lock
+Use for tools defined in .local.toml configs
 
 Examples:
-  
-  $ mise lock                           Update lockfile in current directory for all platforms
-  $ mise lock node python              Update only node and python
-  $ mise lock --platform linux-x64     Update only linux-x64 platform
-  $ mise lock --dry-run                Show what would be updated or created
-  $ mise lock --force                  Re-download and update even if data exists
+
+```
+mise lock                       # update lockfile for all common platforms
+mise lock node python           # update only node and python
+mise lock --platform linux-x64  # update only linux-x64 platform
+mise lock --dry-run             # show what would be updated
+mise lock --local               # update mise.local.lock for local configs
+```

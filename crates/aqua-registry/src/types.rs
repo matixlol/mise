@@ -50,7 +50,7 @@ pub struct AquaPackage {
     pub github_artifact_attestations: Option<AquaGithubArtifactAttestations>,
     overrides: Vec<AquaOverride>,
     version_constraint: String,
-    version_overrides: Vec<AquaPackage>,
+    pub version_overrides: Vec<AquaPackage>,
     pub no_asset: bool,
     pub error_message: Option<String>,
     pub path: Option<String>,
@@ -693,6 +693,7 @@ impl AquaChecksum {
 }
 
 impl AquaCosign {
+    // TODO: This does not support `{{.Asset}}`.
     pub fn opts(&self, pkg: &AquaPackage, v: &str, os: &str, arch: &str) -> Result<Vec<String>> {
         self.opts
             .iter()
@@ -739,43 +740,22 @@ impl AquaCosignSignature {
         pkg.parse_aqua_str(self.url.as_ref().unwrap(), v, &Default::default(), os, arch)
     }
 
-    pub fn asset(&self, pkg: &AquaPackage, v: &str, os: &str, arch: &str) -> Result<String> {
-        pkg.parse_aqua_str(
-            self.asset.as_ref().unwrap(),
-            v,
-            &Default::default(),
-            os,
-            arch,
-        )
-    }
-
-    pub fn arg(&self, pkg: &AquaPackage, v: &str, os: &str, arch: &str) -> Result<String> {
-        match self.r#type.as_deref().unwrap_or_default() {
-            "github_release" => {
-                let asset = self.asset(pkg, v, os, arch)?;
-                let repo_owner = self
-                    .repo_owner
-                    .clone()
-                    .unwrap_or_else(|| pkg.repo_owner.clone());
-                let repo_name = self
-                    .repo_name
-                    .clone()
-                    .unwrap_or_else(|| pkg.repo_name.clone());
-                let repo = format!("{repo_owner}/{repo_name}");
-                Ok(format!(
-                    "https://github.com/{repo}/releases/download/{v}/{asset}"
-                ))
-            }
-            "http" => self.url(pkg, v, os, arch),
-            t => {
-                log::warn!(
-                    "unsupported cosign signature type for {}/{}: {t}",
-                    pkg.repo_owner,
-                    pkg.repo_name
-                );
-                Ok(String::new())
+    pub fn asset_strs(
+        &self,
+        pkg: &AquaPackage,
+        v: &str,
+        os: &str,
+        arch: &str,
+    ) -> Result<IndexSet<String>> {
+        let mut asset_strs = IndexSet::new();
+        if let Some(cosign_asset_template) = &self.asset {
+            for asset in pkg.asset_strs(v, os, arch)? {
+                let mut ctx = HashMap::new();
+                ctx.insert("Asset".to_string(), asset.to_string());
+                asset_strs.insert(pkg.parse_aqua_str(cosign_asset_template, v, &ctx, os, arch)?);
             }
         }
+        Ok(asset_strs)
     }
 
     fn merge(&mut self, other: Self) {
@@ -798,14 +778,22 @@ impl AquaCosignSignature {
 }
 
 impl AquaSlsaProvenance {
-    pub fn asset(&self, pkg: &AquaPackage, v: &str, os: &str, arch: &str) -> Result<String> {
-        pkg.parse_aqua_str(
-            self.asset.as_ref().unwrap(),
-            v,
-            &Default::default(),
-            os,
-            arch,
-        )
+    pub fn asset_strs(
+        &self,
+        pkg: &AquaPackage,
+        v: &str,
+        os: &str,
+        arch: &str,
+    ) -> Result<IndexSet<String>> {
+        let mut asset_strs = IndexSet::new();
+        if let Some(slsa_asset_template) = &self.asset {
+            for asset in pkg.asset_strs(v, os, arch)? {
+                let mut ctx = HashMap::new();
+                ctx.insert("Asset".to_string(), asset.to_string());
+                asset_strs.insert(pkg.parse_aqua_str(slsa_asset_template, v, &ctx, os, arch)?);
+            }
+        }
+        Ok(asset_strs)
     }
 
     pub fn url(&self, pkg: &AquaPackage, v: &str, os: &str, arch: &str) -> Result<String> {
@@ -902,5 +890,28 @@ impl AquaGithubArtifactAttestations {
         if let Some(signer_workflow) = other.signer_workflow {
             self.signer_workflow = Some(signer_workflow);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_aqua_file_src_gradle() {
+        // Test the gradle package src template: {{.AssetWithoutExt | trimSuffix "-bin"}}/bin/gradle
+        let pkg = AquaPackage {
+            repo_owner: "gradle".to_string(),
+            repo_name: "gradle-distributions".to_string(),
+            asset: "gradle-{{trimV .Version}}-bin.zip".to_string(),
+            ..Default::default()
+        };
+        let file = AquaFile {
+            name: "gradle".to_string(),
+            src: Some("{{.AssetWithoutExt | trimSuffix \"-bin\"}}/bin/gradle".to_string()),
+        };
+
+        let result = file.src(&pkg, "8.14.3", "darwin", "arm64").unwrap();
+        assert_eq!(result, Some("gradle-8.14.3/bin/gradle".to_string()));
     }
 }

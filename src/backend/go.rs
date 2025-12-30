@@ -1,14 +1,17 @@
 use crate::backend::Backend;
+use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
+use crate::backend::platform_target::PlatformTarget;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::Config;
 use crate::config::Settings;
 use crate::install_context::InstallContext;
 use crate::timeout;
-use crate::toolset::ToolVersion;
+use crate::toolset::{ToolRequest, ToolVersion};
 use async_trait::async_trait;
 use itertools::Itertools;
+use std::collections::BTreeMap;
 use std::{fmt::Debug, sync::Arc};
 use xx::regex;
 
@@ -31,7 +34,7 @@ impl Backend for GoBackend {
         Ok(vec!["go"])
     }
 
-    async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<String>> {
+    async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
         // Check if go is available
         self.warn_if_dependency_missing(
             config,
@@ -68,19 +71,30 @@ impl Backend for GoBackend {
 
                 for i in indices {
                     let mod_path = parts[..=i].join("/");
-                    let res = cmd!("go", "list", "-m", "-versions", "-json", mod_path)
-                        .full_env(self.dependency_env(config).await?)
-                        .read();
+                    let res = cmd!(
+                        "go",
+                        "list",
+                        "-mod=readonly",
+                        "-m",
+                        "-versions",
+                        "-json",
+                        mod_path
+                    )
+                    .full_env(self.dependency_env(config).await?)
+                    .read();
                     if let Ok(raw) = res {
                         let res = serde_json::from_str::<GoModInfo>(&raw);
-                        if let Ok(mut mod_info) = res {
+                        if let Ok(mod_info) = res {
                             // remove the leading v from the versions
-                            mod_info.versions = mod_info
+                            let versions = mod_info
                                 .versions
                                 .into_iter()
-                                .map(|v| v.trim_start_matches('v').to_string())
+                                .map(|v| VersionInfo {
+                                    version: v.trim_start_matches('v').to_string(),
+                                    ..Default::default()
+                                })
                                 .collect();
-                            return Ok(mod_info.versions);
+                            return Ok(versions);
                         }
                     };
                 }
@@ -97,8 +111,6 @@ impl Backend for GoBackend {
         ctx: &InstallContext,
         tv: ToolVersion,
     ) -> eyre::Result<ToolVersion> {
-        Settings::get().ensure_experimental("go backend")?;
-
         // Check if go is available
         self.warn_if_dependency_missing(
             &ctx.config,
@@ -112,7 +124,7 @@ impl Backend for GoBackend {
         let opts = self.ba.opts();
 
         let install = async |v| {
-            let mut cmd = CmdLineRunner::new("go").arg("install");
+            let mut cmd = CmdLineRunner::new("go").arg("install").arg("-mod=readonly");
 
             if let Some(tags) = opts.get("tags") {
                 cmd = cmd.arg("-tags").arg(tags);
@@ -140,6 +152,27 @@ impl Backend for GoBackend {
 
         Ok(tv)
     }
+
+    fn resolve_lockfile_options(
+        &self,
+        request: &ToolRequest,
+        _target: &PlatformTarget,
+    ) -> BTreeMap<String, String> {
+        let opts = request.options();
+        let mut result = BTreeMap::new();
+
+        // tags affect compilation
+        if let Some(value) = opts.get("tags") {
+            result.insert("tags".to_string(), value.clone());
+        }
+
+        result
+    }
+}
+
+/// Returns install-time-only option keys for Go backend.
+pub fn install_time_option_keys() -> Vec<String> {
+    vec!["tags".into()]
 }
 
 impl GoBackend {

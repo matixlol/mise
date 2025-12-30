@@ -1,4 +1,5 @@
-use crate::backend::{Backend, VersionCacheManager};
+use crate::backend::platform_target::PlatformTarget;
+use crate::backend::{Backend, VersionCacheManager, VersionInfo};
 use crate::build_time::built_info;
 use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::cli::args::BackendArg;
@@ -11,7 +12,7 @@ use crate::install_context::InstallContext;
 use crate::toolset::{ToolRequest, ToolVersion, Toolset};
 use crate::ui::progress_report::SingleReport;
 use crate::{Result, lock_file::LockFile};
-use crate::{cmd, dirs, file, plugins, sysconfig};
+use crate::{dirs, file, plugins, sysconfig};
 use async_trait::async_trait;
 use eyre::{bail, eyre};
 use flate2::read::GzDecoder;
@@ -123,7 +124,7 @@ impl PythonPlugin {
                 let settings = Settings::get();
                 let url_path = python_precompiled_url_path(&settings);
                 let rsp = HTTP_FETCH
-                    .get_bytes(format!("https://mise-versions.jdx.dev/{url_path}"))
+                    .get_bytes(format!("https://mise-versions.jdx.dev/tools/{url_path}"))
                     .await?;
                 let mut decoder = GzDecoder::new(rsp.as_ref());
                 let mut raw = String::new();
@@ -422,13 +423,16 @@ impl Backend for PythonPlugin {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<String>> {
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
         if cfg!(windows) || Settings::get().python.compile == Some(false) {
             Ok(self
                 .fetch_precompiled_remote_versions()
                 .await?
                 .iter()
-                .map(|(v, _, _)| v.clone())
+                .map(|(v, _, _)| VersionInfo {
+                    version: v.clone(),
+                    ..Default::default()
+                })
                 .collect())
         } else {
             self.install_or_update_python_build(None)?;
@@ -439,8 +443,11 @@ impl Backend for PythonPlugin {
                     .split('\n')
                     // remove free-threaded pythons like 3.13t and 3.14t-dev
                     .filter(|s| !regex!(r"\dt(-dev)?$").is_match(s))
-                    .map(|s| s.to_string())
-                    .sorted_by_cached_key(|v| regex!(r"^\d+").is_match(v))
+                    .map(|s| VersionInfo {
+                        version: s.to_string(),
+                        ..Default::default()
+                    })
+                    .sorted_by_cached_key(|v| regex!(r"^\d+").is_match(&v.version))
                     .collect();
                 Ok(versions)
             })
@@ -521,6 +528,41 @@ impl Backend for PythonPlugin {
                 ))
             })
             .clone()
+    }
+
+    fn resolve_lockfile_options(
+        &self,
+        _request: &ToolRequest,
+        target: &PlatformTarget,
+    ) -> BTreeMap<String, String> {
+        let mut opts = BTreeMap::new();
+        let settings = Settings::get();
+        let is_current_platform = target.is_current();
+
+        // Only include compile option if true (non-default)
+        let compile = if is_current_platform {
+            settings.python.compile.unwrap_or(false)
+        } else {
+            false
+        };
+        if compile {
+            opts.insert("compile".to_string(), "true".to_string());
+        }
+
+        // Only include precompiled options if not compiling and if set
+        if !compile && is_current_platform {
+            if let Some(arch) = settings.python.precompiled_arch.clone() {
+                opts.insert("precompiled_arch".to_string(), arch);
+            }
+            if let Some(os) = settings.python.precompiled_os.clone() {
+                opts.insert("precompiled_os".to_string(), os);
+            }
+            if let Some(flavor) = settings.python.precompiled_flavor.clone() {
+                opts.insert("precompiled_flavor".to_string(), flavor);
+            }
+        }
+
+        opts
     }
 }
 

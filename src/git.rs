@@ -7,7 +7,6 @@ use gix::{self};
 use once_cell::sync::OnceCell;
 use xx::file;
 
-use crate::cmd;
 use crate::cmd::CmdLineRunner;
 use crate::config::Settings;
 use crate::file::touch_dir;
@@ -171,6 +170,32 @@ impl Git {
         Ok(())
     }
 
+    pub fn update_submodules(&self) -> Result<()> {
+        debug!("updating submodules in {}", self.dir.display());
+
+        let exec = |cmd: Expression| match cmd.stderr_to_stdout().stdout_capture().unchecked().run()
+        {
+            Ok(res) => {
+                if res.status.success() {
+                    Ok(())
+                } else {
+                    Err(eyre!(
+                        "git failed: {cmd:?} {}",
+                        String::from_utf8(res.stdout).unwrap()
+                    ))
+                }
+            }
+            Err(err) => Err(eyre!("git failed: {cmd:?} {err:#}")),
+        };
+
+        exec(
+            git_cmd!(&self.dir, "submodule", "update", "--init", "--recursive")
+                .env("GIT_TERMINAL_PROMPT", "0"),
+        )?;
+
+        Ok(())
+    }
+
     pub fn current_branch(&self) -> Result<String> {
         let dir = &self.dir;
         if let Ok(repo) = self.repo() {
@@ -232,13 +257,12 @@ impl Git {
         if !self.exists() {
             return None;
         }
-        if let Ok(repo) = self.repo() {
-            if let Ok(remote) = repo.find_remote("origin") {
-                if let Some(url) = remote.url(gix::remote::Direction::Fetch) {
-                    trace!("remote url for {dir:?}: {url}");
-                    return Some(url.to_string());
-                }
-            }
+        if let Ok(repo) = self.repo()
+            && let Ok(remote) = repo.find_remote("origin")
+            && let Some(url) = remote.url(gix::remote::Direction::Fetch)
+        {
+            trace!("remote url for {dir:?}: {url}");
+            return Some(url.to_string());
         }
         let res = git_cmd_read!(&self.dir, "config", "--get", "remote.origin.url");
         match res {

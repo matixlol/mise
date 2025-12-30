@@ -22,15 +22,17 @@ use crate::config::config_file::{config_root, toml::deserialize_arr};
 use crate::config::env_directive::{AgeFormat, EnvDirective, EnvDirectiveOptions, RequiredValue};
 use crate::config::settings::SettingsPartial;
 use crate::config::{Alias, AliasMap, Config};
-use crate::file;
+use crate::env_diff::EnvMap;
 use crate::file::{create_dir_all, display_path};
 use crate::hooks::{Hook, Hooks};
+use crate::prepare::PrepareConfig;
 use crate::redactions::Redactions;
 use crate::registry::REGISTRY;
 use crate::task::Task;
 use crate::tera::{BASE_CONTEXT, get_tera};
 use crate::toolset::{ToolRequest, ToolRequestSet, ToolSource, ToolVersionOptions};
 use crate::watch_files::WatchFile;
+use crate::{env, file};
 
 use super::{ConfigFileType, min_version::MinVersionSpec};
 
@@ -52,6 +54,10 @@ pub struct MiseToml {
     env_path: Vec<String>,
     #[serde(default)]
     alias: AliasMap,
+    #[serde(default)]
+    tool_alias: AliasMap,
+    #[serde(default)]
+    shell_alias: IndexMap<String, String>,
     #[serde(skip)]
     doc: Mutex<OnceCell<DocumentMut>>,
     #[serde(default)]
@@ -68,6 +74,8 @@ pub struct MiseToml {
     tasks: Tasks,
     #[serde(default)]
     watch_files: Vec<WatchFile>,
+    #[serde(default)]
+    prepare: Option<PrepareConfig>,
     #[serde(default)]
     vars: EnvList,
     #[serde(default)]
@@ -100,29 +108,29 @@ impl EnvList {
 
 impl MiseToml {
     fn enforce_min_version_fallback(body: &str) -> eyre::Result<()> {
-        if let Ok(val) = toml::from_str::<toml::Value>(body) {
-            if let Some(min_val) = val.get("min_version") {
-                let mut hard_req: Option<versions::Versioning> = None;
-                let mut soft_req: Option<versions::Versioning> = None;
-                match min_val {
-                    toml::Value::String(s) => {
+        if let Ok(val) = toml::from_str::<toml::Value>(body)
+            && let Some(min_val) = val.get("min_version")
+        {
+            let mut hard_req: Option<versions::Versioning> = None;
+            let mut soft_req: Option<versions::Versioning> = None;
+            match min_val {
+                toml::Value::String(s) => {
+                    hard_req = versions::Versioning::new(s);
+                }
+                toml::Value::Table(t) => {
+                    if let Some(toml::Value::String(s)) = t.get("hard") {
                         hard_req = versions::Versioning::new(s);
                     }
-                    toml::Value::Table(t) => {
-                        if let Some(toml::Value::String(s)) = t.get("hard") {
-                            hard_req = versions::Versioning::new(s);
-                        }
-                        if let Some(toml::Value::String(s)) = t.get("soft") {
-                            soft_req = versions::Versioning::new(s);
-                        }
+                    if let Some(toml::Value::String(s)) = t.get("soft") {
+                        soft_req = versions::Versioning::new(s);
                     }
-                    _ => {}
                 }
-                if let Some(spec) =
-                    crate::config::config_file::min_version::MinVersionSpec::new(hard_req, soft_req)
-                {
-                    crate::config::Config::enforce_min_version_spec(&spec)?;
-                }
+                _ => {}
+            }
+            if let Some(spec) =
+                crate::config::config_file::min_version::MinVersionSpec::new(hard_req, soft_req)
+            {
+                crate::config::Config::enforce_min_version_spec(&spec)?;
             }
         }
         Ok(())
@@ -137,11 +145,13 @@ impl MiseToml {
             "config_root",
             config_root::config_root(path).to_str().unwrap(),
         );
-        Self {
+        let mut rf = Self {
             path: path.to_path_buf(),
             context,
             ..Default::default()
-        }
+        };
+        rf.update_context_env(env::PRISTINE_ENV.clone());
+        rf
     }
 
     pub fn from_file(path: &Path) -> eyre::Result<Self> {
@@ -164,8 +174,11 @@ impl MiseToml {
             }
         };
         rf.context = BASE_CONTEXT.clone();
-        rf.context
-            .insert("config_root", path.parent().unwrap().to_str().unwrap());
+        rf.context.insert(
+            "config_root",
+            config_root::config_root(path).to_str().unwrap(),
+        );
+        rf.update_context_env(env::PRISTINE_ENV.clone());
         rf.path = path.to_path_buf();
         let project_root = rf.project_root().map(|p| p.to_path_buf());
         for task in rf.tasks.0.values_mut() {
@@ -196,7 +209,7 @@ impl MiseToml {
         self.doc_mut()?
             .get_mut()
             .unwrap()
-            .entry("alias")
+            .entry("tool_alias")
             .or_insert_with(table)
             .as_table_like_mut()
             .unwrap()
@@ -205,7 +218,7 @@ impl MiseToml {
     }
 
     pub fn set_alias(&mut self, fa: &BackendArg, from: &str, to: &str) -> eyre::Result<()> {
-        self.alias
+        self.tool_alias
             .entry(fa.short.to_string())
             .or_default()
             .versions
@@ -213,7 +226,7 @@ impl MiseToml {
         self.doc_mut()?
             .get_mut()
             .unwrap()
-            .entry("alias")
+            .entry("tool_alias")
             .or_insert_with(table)
             .as_table_like_mut()
             .unwrap()
@@ -232,41 +245,77 @@ impl MiseToml {
     pub fn remove_backend_alias(&mut self, fa: &BackendArg) -> eyre::Result<()> {
         let mut doc = self.doc_mut()?;
         let doc = doc.get_mut().unwrap();
-        if let Some(aliases) = doc.get_mut("alias").and_then(|v| v.as_table_mut()) {
-            aliases.remove(&fa.short);
-            if aliases.is_empty() {
-                doc.as_table_mut().remove("alias");
+        // Remove from both tool_alias and deprecated alias sections
+        for section in ["tool_alias", "alias"] {
+            if let Some(aliases) = doc.get_mut(section).and_then(|v| v.as_table_mut()) {
+                aliases.remove(&fa.short);
+                if aliases.is_empty() {
+                    doc.as_table_mut().remove(section);
+                }
             }
         }
         Ok(())
     }
 
     pub fn remove_alias(&mut self, fa: &BackendArg, from: &str) -> eyre::Result<()> {
-        if let Some(aliases) = self.alias.get_mut(&fa.short) {
-            aliases.versions.shift_remove(from);
-            if aliases.versions.is_empty() && aliases.backend.is_none() {
-                self.alias.shift_remove(&fa.short);
+        // Remove from both tool_alias and deprecated alias in memory
+        for alias_map in [&mut self.tool_alias, &mut self.alias] {
+            if let Some(aliases) = alias_map.get_mut(&fa.short) {
+                aliases.versions.shift_remove(from);
+                if aliases.versions.is_empty() && aliases.backend.is_none() {
+                    alias_map.shift_remove(&fa.short);
+                }
             }
         }
         let mut doc = self.doc_mut()?;
         let doc = doc.get_mut().unwrap();
-        if let Some(aliases) = doc.get_mut("alias").and_then(|v| v.as_table_mut()) {
-            if let Some(alias) = aliases
-                .get_mut(&fa.to_string())
-                .and_then(|v| v.as_table_mut())
-            {
-                if let Some(versions) = alias.get_mut("versions").and_then(|v| v.as_table_mut()) {
-                    versions.remove(from);
-                    if versions.is_empty() {
-                        alias.remove("versions");
+        // Remove from both tool_alias and deprecated alias sections in doc
+        for section in ["tool_alias", "alias"] {
+            if let Some(aliases) = doc.get_mut(section).and_then(|v| v.as_table_mut()) {
+                if let Some(alias) = aliases
+                    .get_mut(&fa.to_string())
+                    .and_then(|v| v.as_table_mut())
+                {
+                    if let Some(versions) = alias.get_mut("versions").and_then(|v| v.as_table_mut())
+                    {
+                        versions.remove(from);
+                        if versions.is_empty() {
+                            alias.remove("versions");
+                        }
+                    }
+                    if alias.is_empty() {
+                        aliases.remove(&fa.to_string());
                     }
                 }
-                if alias.is_empty() {
-                    aliases.remove(&fa.to_string());
+                if aliases.is_empty() {
+                    doc.as_table_mut().remove(section);
                 }
             }
-            if aliases.is_empty() {
-                doc.as_table_mut().remove("alias");
+        }
+        Ok(())
+    }
+
+    pub fn set_shell_alias(&mut self, name: &str, command: &str) -> eyre::Result<()> {
+        self.shell_alias.insert(name.into(), command.into());
+        self.doc_mut()?
+            .get_mut()
+            .unwrap()
+            .entry("shell_alias")
+            .or_insert_with(table)
+            .as_table_like_mut()
+            .unwrap()
+            .insert(name, value(command));
+        Ok(())
+    }
+
+    pub fn remove_shell_alias(&mut self, name: &str) -> eyre::Result<()> {
+        self.shell_alias.shift_remove(name);
+        let mut doc = self.doc_mut()?;
+        let doc = doc.get_mut().unwrap();
+        if let Some(shell_alias) = doc.get_mut("shell_alias").and_then(|v| v.as_table_mut()) {
+            shell_alias.remove(name);
+            if shell_alias.is_empty() {
+                doc.as_table_mut().remove("shell_alias");
             }
         }
         Ok(())
@@ -356,6 +405,23 @@ impl MiseToml {
         Ok(())
     }
 
+    // Merge base OS env vars with env sections from this file,
+    // so they are available for templating.
+    // Note this only merges regular key-value variables; referenced files are not resolved.
+    fn update_context_env(&mut self, mut base_env: EnvMap) {
+        let env_vars = self
+            .env
+            .0
+            .iter()
+            .filter_map(|e| match e {
+                EnvDirective::Val(key, value, _) => Some((key.clone(), value.clone())),
+                _ => None,
+            })
+            .collect::<IndexMap<_, _>>();
+        base_env.extend(env_vars);
+        self.context.insert("env", &base_env);
+    }
+
     fn parse_template(&self, input: &str) -> eyre::Result<String> {
         self.parse_template_with_context(&self.context, input)
     }
@@ -434,12 +500,12 @@ impl ConfigFile for MiseToml {
         tools.shift_remove(fa);
         let mut doc = self.doc_mut()?;
         let doc = doc.get_mut().unwrap();
-        if let Some(tools) = doc.get_mut("tools") {
-            if let Some(tools) = tools.as_table_like_mut() {
-                tools.remove(&fa.to_string());
-                if tools.is_empty() {
-                    doc.as_table_mut().remove("tools");
-                }
+        if let Some(tools) = doc.get_mut("tools")
+            && let Some(tools) = tools.as_table_like_mut()
+        {
+            tools.remove(&fa.to_string());
+            if tools.is_empty() {
+                doc.as_table_mut().remove("tools");
             }
         }
         Ok(())
@@ -454,11 +520,11 @@ impl ConfigFile for MiseToml {
             if opts.os.is_some() || !opts.install_env.is_empty() {
                 return false;
             }
-            if let Some(reg_ba) = REGISTRY.get(ba.short.as_str()).and_then(|b| b.ba()) {
-                if reg_ba.opts.as_ref().is_some_and(|o| o == opts) {
-                    // in this case the options specified are the same as in the registry so output no options and rely on the defaults
-                    return true;
-                }
+            if let Some(reg_ba) = REGISTRY.get(ba.short.as_str()).and_then(|b| b.ba())
+                && reg_ba.opts.as_ref().is_some_and(|o| o == opts)
+            {
+                // in this case the options specified are the same as in the registry so output no options and rely on the defaults
+                return true;
             }
             opts.is_empty()
         };
@@ -559,18 +625,18 @@ impl ConfigFile for MiseToml {
         let mut trs = ToolRequestSet::new();
         let tools = self.tools.lock().unwrap();
         let mut context = self.context.clone();
-        if context.get("vars").is_none() {
-            if let Some(config) = Config::maybe_get() {
-                if let Some(vars_results) = config.vars_results_cached() {
-                    let vars = vars_results
-                        .vars
-                        .iter()
-                        .map(|(k, (v, _))| (k.clone(), v.clone()))
-                        .collect::<IndexMap<_, _>>();
-                    context.insert("vars", &vars);
-                } else if !config.vars.is_empty() {
-                    context.insert("vars", &config.vars);
-                }
+        if context.get("vars").is_none()
+            && let Some(config) = Config::maybe_get()
+        {
+            if let Some(vars_results) = config.vars_results_cached() {
+                let vars = vars_results
+                    .vars
+                    .iter()
+                    .map(|(k, (v, _))| (k.clone(), v.clone()))
+                    .collect::<IndexMap<_, _>>();
+                context.insert("vars", &vars);
+            } else if !config.vars.is_empty() {
+                context.insert("vars", &config.vars);
             }
         }
         for (ba, tvp) in tools.iter() {
@@ -581,10 +647,29 @@ impl ConfigFile for MiseToml {
                         *v = self.parse_template_with_context(&context, v)?;
                     }
                     let mut ba = ba.clone();
+                    // Start with cached options but filter out install-time-only options
+                    // when config provides its own options. This allows:
+                    // - Changing url/asset_pattern/checksum without reinstall issues
+                    // - Preserving post-install options like bin_path for binary discovery
                     let mut ba_opts = ba.opts().clone();
+                    let install_time_keys =
+                        crate::backend::install_time_option_keys_for_type(&ba.backend_type());
+                    if !install_time_keys.is_empty() {
+                        ba_opts.opts.retain(|k, _| {
+                            // Keep option if it's NOT an install-time-only key
+                            // Also filter platform-specific variants (platforms.X.key)
+                            !install_time_keys.contains(k)
+                                && !install_time_keys.iter().any(|itk| {
+                                    k.starts_with("platforms.") && k.ends_with(&format!(".{itk}"))
+                                })
+                        });
+                    }
                     ba_opts.merge(&options.opts);
+                    // Copy os and install_env from config (not cached)
+                    ba_opts.os = options.os.clone();
+                    ba_opts.install_env = options.install_env.clone();
                     ba.set_opts(Some(ba_opts.clone()));
-                    ToolRequest::new_opts(ba.into(), &version, options, source.clone())?
+                    ToolRequest::new_opts(ba.into(), &version, ba_opts, source.clone())?
                 } else {
                     ToolRequest::new(ba.clone().into(), &version, source.clone())?
                 };
@@ -595,8 +680,22 @@ impl ConfigFile for MiseToml {
     }
 
     fn aliases(&self) -> eyre::Result<AliasMap> {
-        self.alias
-            .clone()
+        // Emit deprecation warning if [alias] is used
+        if !self.alias.is_empty() {
+            deprecated!(
+                "alias",
+                "[alias] is deprecated, use [tool_alias] instead in {}",
+                display_path(&self.path)
+            );
+        }
+
+        // Merge alias and tool_alias, with tool_alias taking precedence
+        let mut combined: AliasMap = self.alias.clone();
+        for (k, v) in &self.tool_alias {
+            combined.insert(k.clone(), v.clone());
+        }
+
+        combined
             .iter()
             .map(|(k, v)| {
                 let versions = v
@@ -615,6 +714,16 @@ impl ConfigFile for MiseToml {
                         versions,
                     },
                 ))
+            })
+            .collect()
+    }
+
+    fn shell_aliases(&self) -> eyre::Result<IndexMap<String, String>> {
+        self.shell_alias
+            .iter()
+            .map(|(k, v)| {
+                let v = self.parse_template(v)?;
+                Ok((k.clone(), v))
             })
             .collect()
     }
@@ -666,6 +775,10 @@ impl ConfigFile for MiseToml {
             .flatten()
             .collect())
     }
+
+    fn prepare_config(&self) -> Option<PrepareConfig> {
+        self.prepare.clone()
+    }
 }
 
 /// Returns a [`toml_edit::Key`] from the given `key`.
@@ -694,10 +807,10 @@ impl Debug for MiseToml {
         if !self.env_file.is_empty() {
             d.field("env_file", &self.env_file);
         }
-        if let Ok(env) = self.env_entries() {
-            if !env.is_empty() {
-                d.field("env", &env);
-            }
+        if let Ok(env) = self.env_entries()
+            && !env.is_empty()
+        {
+            d.field("env", &env);
         }
         if !self.alias.is_empty() {
             d.field("alias", &self.alias);
@@ -723,6 +836,8 @@ impl Clone for MiseToml {
             env: self.env.clone(),
             env_path: self.env_path.clone(),
             alias: self.alias.clone(),
+            tool_alias: self.tool_alias.clone(),
+            shell_alias: self.shell_alias.clone(),
             doc: Mutex::new(self.doc.lock().unwrap().clone()),
             hooks: self.hooks.clone(),
             tools: Mutex::new(self.tools.lock().unwrap().clone()),
@@ -732,6 +847,7 @@ impl Clone for MiseToml {
             task_config: self.task_config.clone(),
             settings: self.settings.clone(),
             watch_files: self.watch_files.clone(),
+            prepare: self.prepare.clone(),
             vars: self.vars.clone(),
             experimental_monorepo_root: self.experimental_monorepo_root,
         }
@@ -1466,7 +1582,24 @@ impl<'de> de::Deserialize<'de> for MiseTomlTool {
                             }
                         },
                         _ => {
-                            options.opts.insert(k, v.as_str().unwrap().to_string());
+                            // Handle nested tables (like platform.macos-arm64)
+                            // and convert them to string representation for ToolVersionOptions
+                            let value_str = match v {
+                                toml::Value::String(s) => {
+                                    // Convert {{version}} to {version} for backend templating
+                                    s.replace("{{version}}", "{version}")
+                                }
+                                toml::Value::Table(_) | toml::Value::Array(_) => {
+                                    // Serialize complex types back to TOML string
+                                    // This preserves nested structures like platform.macos-arm64.bin_path
+                                    toml::to_string(&v).map_err(de::Error::custom)?
+                                }
+                                toml::Value::Boolean(b) => b.to_string(),
+                                toml::Value::Integer(i) => i.to_string(),
+                                toml::Value::Float(f) => f.to_string(),
+                                toml::Value::Datetime(dt) => dt.to_string(),
+                            };
+                            options.opts.insert(k, value_str);
                         }
                     }
                 }
@@ -1644,10 +1777,10 @@ impl<'de> de::Deserialize<'de> for Alias {
 fn is_tools_sorted(tools: &IndexMap<BackendArg, MiseTomlToolList>) -> bool {
     let mut last = None;
     for k in tools.keys() {
-        if let Some(last) = last {
-            if k < last {
-                return false;
-            }
+        if let Some(last) = last
+            && k < last
+        {
+            return false;
         }
         last = Some(k);
     }
@@ -1712,6 +1845,30 @@ mod tests {
             assert_snapshot!(cf);
             assert_debug_snapshot!(cf);
         });
+    }
+
+    #[tokio::test]
+    async fn test_env_var_in_tool() {
+        let _config = Config::get().await.unwrap();
+        let p = CWD.as_ref().unwrap().join(".test.mise.toml");
+        file::write(
+            &p,
+            r#"
+        [env]
+        TERRAFORM_VERSION = '1.0.0'
+        JQ_PREFIX = '1.6'
+
+        [tools]
+        terraform = "{{env.TERRAFORM_VERSION}}"
+        jq = { prefix = "{{ env.JQ_PREFIX }}" }
+        "#,
+        )
+        .unwrap();
+        let cf = MiseToml::from_file(&p).unwrap();
+        assert_snapshot!(replace_path(&format!(
+            "{:#?}",
+            cf.to_tool_request_set().unwrap().tools
+        )));
     }
 
     #[tokio::test]
@@ -1836,7 +1993,7 @@ mod tests {
         file::write(
             &p,
             formatdoc! {r#"
-            [alias.node.versions]
+            [tool_alias.node.versions]
             16 = "16.0.0"
             18 = "18.0.0"
         "#},
@@ -1849,7 +2006,7 @@ mod tests {
         cf.set_alias(&node, "20", "20.0.0").unwrap();
         cf.set_alias(&python, "3.10", "3.10.0").unwrap();
 
-        assert_debug_snapshot!(cf.alias);
+        assert_debug_snapshot!(cf.tool_alias);
         let cf: Box<dyn ConfigFile> = Box::new(cf);
         assert_snapshot!(cf);
         file::remove_file(&p).unwrap();

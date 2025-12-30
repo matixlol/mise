@@ -4,7 +4,7 @@
 - **Usage**: `mise generate tool-stub [FLAGS] <OUTPUT>`
 - **Source code**: [`src/cli/generate/tool_stub.rs`](https://github.com/jdx/mise/blob/main/src/cli/generate/tool_stub.rs)
 
-[experimental] Generate a tool stub for HTTP-based tools
+Generate a tool stub for HTTP-based tools
 
 This command generates tool stubs that can automatically download and execute
 tools from HTTP URLs. It can detect checksums, file sizes, and binary paths
@@ -22,15 +22,45 @@ Output file path for the tool stub
 
 ## Flags
 
-### `--version <VERSION>`
+### `-b --bin <BIN>`
 
-Version of the tool
+Binary path within the extracted archive
 
-### `-u --url <URL>`
+If not specified and the archive is downloaded, will auto-detect the most likely binary
 
-URL for downloading the tool
+### `--bootstrap`
 
-Example: <https://github.com/owner/repo/releases/download/v2.0.0/tool-linux-x64.tar.gz>
+Wrap stub in a bootstrap script that installs mise if not already present
+
+When enabled, generates a bash script that:
+1. Checks if mise is installed at the expected path
+2. If not, downloads and installs mise using the embedded installer
+3. Executes the tool stub using mise
+
+### `--bootstrap-version <BOOTSTRAP_VERSION>`
+
+Specify mise version for the bootstrap script
+
+By default, uses the latest version from the install script.
+Use this to pin to a specific version (e.g., "2025.1.0").
+
+### `--fetch`
+
+Fetch checksums and sizes for an existing tool stub file
+
+This reads an existing stub file and fills in any missing checksum/size fields by downloading the files. URLs must already be present in the stub.
+
+### `--http <HTTP>`
+
+HTTP backend type to use
+
+**Default:** `http`
+
+### `--platform-bin… <PLATFORM_BIN>`
+
+Platform-specific binary paths in the format platform:path
+
+Examples: --platform-bin windows-x64:tool.exe --platform-bin linux-x64:bin/tool
 
 ### `--platform-url… <PLATFORM_URL>`
 
@@ -42,31 +72,21 @@ If only a URL is provided (without platform:), the platform will be automaticall
 
 Examples: --platform-url linux-x64:https://... --platform-url <https://nodejs.org/dist/v22.17.1/node-v22.17.1-darwin-arm64.tar.gz>
 
-### `--platform-bin… <PLATFORM_BIN>`
-
-Platform-specific binary paths in the format platform:path
-
-Examples: --platform-bin windows-x64:tool.exe --platform-bin linux-x64:bin/tool
-
-### `-b --bin <BIN>`
-
-Binary path within the extracted archive
-
-If not specified and the archive is downloaded, will auto-detect the most likely binary
-
 ### `--skip-download`
 
 Skip downloading for checksum and binary path detection (faster but less informative)
 
-### `--fetch`
+### `-u --url <URL>`
 
-Fetch checksums and sizes for an existing tool stub file
+URL for downloading the tool
 
-This reads an existing stub file and fills in any missing checksum/size fields by downloading the files. URLs must already be present in the stub.
+Example: <https://github.com/owner/repo/releases/download/v2.0.0/tool-linux-x64.tar.gz>
 
-### `--http <HTTP>`
+### `--version <VERSION>`
 
-HTTP backend type to use
+Version of the tool
+
+**Default:** `latest`
 
 Examples:
 
@@ -103,4 +123,11 @@ $ mise generate tool-stub ./bin/tool --url "https://example.com/tool.tar.gz" --s
 Fetch checksums for an existing stub:
 $ mise generate tool-stub ./bin/jq --fetch
 # This will read the existing stub and download files to fill in any missing checksums/sizes
+
+Generate a bootstrap stub that installs mise if needed:
+$ mise generate tool-stub ./bin/tool --url "https://example.com/tool.tar.gz" --bootstrap
+# The stub will check for mise and install it automatically before running the tool
+
+Generate a bootstrap stub with a pinned mise version:
+$ mise generate tool-stub ./bin/tool --url "https://example.com/tool.tar.gz" --bootstrap --bootstrap-version 2025.1.0
 ```

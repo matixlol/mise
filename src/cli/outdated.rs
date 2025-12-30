@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use crate::cli::args::ToolArg;
 use crate::config::Config;
-use crate::toolset::ToolsetBuilder;
 use crate::toolset::outdated_info::OutdatedInfo;
+use crate::toolset::{ResolveOptions, ToolsetBuilder};
 use crate::ui::table;
 use eyre::Result;
 use indexmap::IndexMap;
@@ -22,6 +22,10 @@ pub struct Outdated {
     #[clap(value_name = "TOOL@VERSION", verbatim_doc_comment)]
     pub tool: Vec<ToolArg>,
 
+    /// Output in JSON format
+    #[clap(short = 'J', long, verbatim_doc_comment)]
+    pub json: bool,
+
     /// Compares against the latest versions available, not what matches the current config
     ///
     /// For example, if you have `node = "20"` in your config by default `mise outdated` will only
@@ -30,10 +34,6 @@ pub struct Outdated {
     /// Using this flag, if there are 21.x or newer versions it will display those instead of 20.x.
     #[clap(long, short = 'l', verbatim_doc_comment)]
     pub bump: bool,
-
-    /// Output in JSON format
-    #[clap(short = 'J', long, verbatim_doc_comment)]
-    pub json: bool,
 
     /// Don't show table header
     #[clap(long)]
@@ -54,7 +54,9 @@ impl Outdated {
             .collect::<HashSet<_>>();
         ts.versions
             .retain(|_, tvl| tool_set.is_empty() || tool_set.contains(&tvl.backend));
-        let outdated = ts.list_outdated_versions(&config, self.bump).await;
+        let outdated = ts
+            .list_outdated_versions(&config, self.bump, &ResolveOptions::default())
+            .await;
         self.display(outdated).await?;
         Ok(())
     }

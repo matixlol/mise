@@ -11,23 +11,6 @@ export const commands: { [key: string]: Command } = {
   activate: {
     hide: false,
   },
-  alias: {
-    hide: false,
-    subcommands: {
-      get: {
-        hide: false,
-      },
-      ls: {
-        hide: false,
-      },
-      set: {
-        hide: false,
-      },
-      unset: {
-        hide: false,
-      },
-    },
-  },
   asdf: {
     hide: true,
   },
@@ -85,13 +68,13 @@ export const commands: { [key: string]: Command } = {
   direnv: {
     hide: true,
     subcommands: {
+      activate: {
+        hide: true,
+      },
       envrc: {
         hide: true,
       },
       exec: {
-        hide: true,
-      },
-      activate: {
         hide: true,
       },
     },
@@ -210,6 +193,9 @@ export const commands: { [key: string]: Command } = {
       },
     },
   },
+  prepare: {
+    hide: false,
+  },
   prune: {
     hide: false,
   },
@@ -217,9 +203,6 @@ export const commands: { [key: string]: Command } = {
     hide: false,
   },
   "render-help": {
-    hide: true,
-  },
-  "render-mangen": {
     hide: true,
   },
   reshim: {
@@ -260,6 +243,23 @@ export const commands: { [key: string]: Command } = {
   shell: {
     hide: false,
   },
+  "shell-alias": {
+    hide: false,
+    subcommands: {
+      get: {
+        hide: false,
+      },
+      ls: {
+        hide: false,
+      },
+      set: {
+        hide: false,
+      },
+      unset: {
+        hide: false,
+      },
+    },
+  },
   sync: {
     hide: false,
     subcommands: {
@@ -295,6 +295,9 @@ export const commands: { [key: string]: Command } = {
       run: {
         hide: false,
       },
+      validate: {
+        hide: false,
+      },
     },
   },
   "test-tool": {
@@ -302,6 +305,23 @@ export const commands: { [key: string]: Command } = {
   },
   tool: {
     hide: false,
+  },
+  "tool-alias": {
+    hide: false,
+    subcommands: {
+      get: {
+        hide: false,
+      },
+      ls: {
+        hide: false,
+      },
+      set: {
+        hide: false,
+      },
+      unset: {
+        hide: false,
+      },
+    },
   },
   "tool-stub": {
     hide: false,

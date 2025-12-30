@@ -1,7 +1,9 @@
 use crate::backend::backend_type::BackendType;
 use crate::cli::args::BackendArg;
 use crate::config::Settings;
+use crate::toolset::ToolVersionOptions;
 use heck::ToShoutySnakeCase;
+use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::env::consts::{ARCH, OS};
@@ -32,6 +34,7 @@ pub struct RegistryTool {
 pub struct RegistryBackend {
     pub full: &'static str,
     pub platforms: &'static [&'static str],
+    pub options: &'static [(&'static str, &'static str)],
 }
 
 // Cache for environment variable overrides
@@ -75,9 +78,11 @@ impl RegistryTool {
             }
             backend_types
         });
-        let os = Settings::get().os.clone().unwrap_or(OS.to_string());
-        let arch = Settings::get().arch.clone().unwrap_or(ARCH.to_string());
+        let settings = Settings::get();
+        let os = settings.os.clone().unwrap_or(OS.to_string());
+        let arch = settings.arch.clone().unwrap_or(ARCH.to_string());
         let platform = format!("{os}-{arch}");
+        let experimental = settings.experimental;
         self.backends
             .iter()
             .filter(|rb| {
@@ -92,6 +97,14 @@ impl RegistryTool {
                     .next()
                     .is_some_and(|b| BACKEND_TYPES.contains(b))
             })
+            // Filter out experimental backends if experimental mode is disabled
+            .filter(|full| {
+                if experimental {
+                    return true;
+                }
+                let backend_type = BackendType::guess(full);
+                !backend_type.is_experimental()
+            })
             .collect()
     }
 
@@ -103,6 +116,27 @@ impl RegistryTool {
         self.backends()
             .first()
             .map(|f| BackendArg::new(self.short.to_string(), Some(f.to_string())))
+    }
+
+    /// Get RegistryBackend for a specific full backend string
+    pub fn get_backend(&self, full: &str) -> Option<&RegistryBackend> {
+        self.backends.iter().find(|rb| rb.full == full)
+    }
+
+    /// Get options for a specific backend
+    pub fn backend_options(&self, full: &str) -> ToolVersionOptions {
+        let mut opts = IndexMap::new();
+
+        if let Some(backend) = self.get_backend(full) {
+            for (k, v) in backend.options {
+                opts.insert(k.to_string(), v.to_string());
+            }
+        }
+
+        ToolVersionOptions {
+            opts,
+            ..Default::default()
+        }
     }
 }
 
@@ -132,7 +166,7 @@ pub fn is_trusted_plugin(name: &str, remote: &str) -> bool {
     !is_shorthand || is_mise_url
 }
 
-fn normalize_remote(remote: &str) -> eyre::Result<String> {
+pub fn normalize_remote(remote: &str) -> eyre::Result<String> {
     let url = Url::parse(remote)?;
     let host = url.host_str().unwrap();
     let path = url.path().trim_end_matches(".git");

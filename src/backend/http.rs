@@ -1,9 +1,11 @@
 use crate::backend::Backend;
+use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
 use crate::backend::static_helpers::{
     clean_binary_name, get_filename_from_url, list_available_platforms_with_key,
     lookup_platform_key, template_string, verify_artifact,
 };
+use crate::backend::version_list;
 use crate::cli::args::BackendArg;
 use crate::config::Config;
 use crate::config::Settings;
@@ -21,6 +23,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Constants
+const HTTP_TARBALLS_DIR: &str = "http-tarballs";
+const METADATA_FILE: &str = "metadata.json";
+
+/// Helper to get an option value with platform-specific fallback
+fn get_opt(opts: &ToolVersionOptions, key: &str) -> Option<String> {
+    lookup_platform_key(opts, key).or_else(|| opts.get(key).cloned())
+}
+
+/// Metadata stored alongside cached extractions
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheMetadata {
     url: String,
@@ -28,6 +40,82 @@ struct CacheMetadata {
     size: u64,
     extracted_at: u64,
     platform: String,
+}
+
+/// Describes what type of content was extracted to cache
+#[derive(Debug, Clone)]
+enum ExtractionType {
+    /// A single raw file (not an archive) with its filename
+    RawFile { filename: String },
+    /// An archive (tarball, zip, etc.) that was extracted
+    Archive,
+}
+
+/// Information about a downloaded file's format
+struct FileInfo {
+    /// Path with effective extension (after applying format option)
+    effective_path: PathBuf,
+    /// File extension
+    extension: String,
+    /// Detected archive format
+    format: file::TarFormat,
+    /// Whether this is a compressed single binary (not a tar archive)
+    is_compressed_binary: bool,
+}
+
+impl FileInfo {
+    /// Analyze a file path and options to determine format information
+    fn new(file_path: &Path, opts: &ToolVersionOptions) -> Self {
+        // Apply format config to determine effective extension
+        let effective_path = if let Some(added_ext) = get_opt(opts, "format") {
+            let mut path = file_path.to_path_buf();
+            let current_ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let new_ext = if current_ext.is_empty() {
+                added_ext
+            } else {
+                format!("{}.{}", current_ext, added_ext)
+            };
+            path.set_extension(new_ext);
+            path
+        } else {
+            file_path.to_path_buf()
+        };
+
+        let extension = effective_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let format = file::TarFormat::from_ext(&extension);
+
+        let file_name = effective_path.file_name().unwrap().to_string_lossy();
+        let is_compressed_binary = !file_name.contains(".tar")
+            && matches!(extension.as_str(), "gz" | "xz" | "bz2" | "zst");
+
+        Self {
+            effective_path,
+            extension,
+            format,
+            is_compressed_binary,
+        }
+    }
+
+    /// Get the filename portion of the effective path
+    fn file_name(&self) -> String {
+        self.effective_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// Get the decompressed name (for compressed binaries)
+    fn decompressed_name(&self) -> String {
+        self.file_name()
+            .trim_end_matches(&format!(".{}", self.extension))
+            .to_string()
+    }
 }
 
 #[derive(Debug)]
@@ -40,260 +128,375 @@ impl HttpBackend {
         Self { ba: Arc::new(ba) }
     }
 
-    /// Generate a cache key based on the actual file content (checksum) and extraction options
-    fn get_file_based_cache_key(
-        &self,
-        file_path: &Path,
-        opts: &ToolVersionOptions,
-    ) -> Result<String> {
+    // -------------------------------------------------------------------------
+    // Cache path helpers
+    // -------------------------------------------------------------------------
+
+    /// Get the http-tarballs directory in DATA (survives `mise cache clear`)
+    fn tarballs_dir() -> PathBuf {
+        dirs::DATA.join(HTTP_TARBALLS_DIR)
+    }
+
+    /// Get the path to a specific cache entry
+    fn cache_path(&self, cache_key: &str) -> PathBuf {
+        Self::tarballs_dir().join(cache_key)
+    }
+
+    /// Get the path to the metadata file for a cache entry
+    fn metadata_path(&self, cache_key: &str) -> PathBuf {
+        self.cache_path(cache_key).join(METADATA_FILE)
+    }
+
+    /// Check if a cache entry exists and is valid
+    fn is_cached(&self, cache_key: &str) -> bool {
+        self.cache_path(cache_key).exists() && self.metadata_path(cache_key).exists()
+    }
+
+    // -------------------------------------------------------------------------
+    // Cache key generation
+    // -------------------------------------------------------------------------
+
+    /// Generate a cache key based on file content and extraction options
+    fn cache_key(&self, file_path: &Path, opts: &ToolVersionOptions) -> Result<String> {
         let checksum = hash::file_hash_blake3(file_path, None)?;
 
-        // Include extraction options in cache key to handle different extraction needs
-        let mut cache_key_parts = vec![checksum.clone()];
+        // Include extraction options that affect output structure
+        // Note: bin_path is NOT included - handled at symlink time for deduplication
+        let mut parts = vec![checksum];
 
-        if let Some(strip_components) = opts.get("strip_components") {
-            cache_key_parts.push(format!("strip_{strip_components}"));
+        if let Some(strip) = get_opt(opts, "strip_components") {
+            parts.push(format!("strip_{strip}"));
         }
 
-        let cache_key = cache_key_parts.join("_");
-        debug!("Using file-based checksum as cache key: {}", cache_key);
-        Ok(cache_key)
+        let key = parts.join("_");
+        debug!("Cache key: {}", key);
+        Ok(key)
     }
 
-    /// Get the path to the cached tarball directory
-    fn get_cached_tarball_path(&self, cache_key: &str) -> PathBuf {
-        dirs::CACHE.join("http-tarballs").join(cache_key)
+    // -------------------------------------------------------------------------
+    // Filename determination
+    // -------------------------------------------------------------------------
+
+    /// Determine the destination filename for a raw file or compressed binary
+    fn dest_filename(
+        &self,
+        file_path: &Path,
+        file_info: &FileInfo,
+        opts: &ToolVersionOptions,
+    ) -> String {
+        // Check for explicit bin name first
+        if let Some(bin_name) = get_opt(opts, "bin") {
+            return bin_name;
+        }
+
+        // Auto-clean the binary name
+        let raw_name = if file_info.is_compressed_binary {
+            file_info.decompressed_name()
+        } else {
+            file_path.file_name().unwrap().to_string_lossy().to_string()
+        };
+
+        clean_binary_name(&raw_name, Some(&self.ba.tool_name))
     }
 
-    /// Get the path to the extracted contents within the cache
-    fn get_cached_extracted_path(&self, cache_key: &str) -> PathBuf {
-        self.get_cached_tarball_path(cache_key)
+    // -------------------------------------------------------------------------
+    // Extraction type detection
+    // -------------------------------------------------------------------------
+
+    /// Detect extraction type from an existing cache directory
+    /// This handles the case where a cache hit occurs but the original extraction
+    /// used different options (e.g., different `bin` name)
+    fn extraction_type_from_cache(&self, cache_key: &str, file_info: &FileInfo) -> ExtractionType {
+        // For archives, we don't need to detect the filename
+        if !file_info.is_compressed_binary && file_info.format != file::TarFormat::Raw {
+            return ExtractionType::Archive;
+        }
+
+        // For raw files, find the actual filename in the cache directory
+        let cache_path = self.cache_path(cache_key);
+        for entry in xx::file::ls(&cache_path).unwrap_or_default() {
+            if let Some(name) = entry.file_name().map(|n| n.to_string_lossy().to_string()) {
+                // Skip metadata file
+                if name != METADATA_FILE {
+                    return ExtractionType::RawFile { filename: name };
+                }
+            }
+        }
+
+        // Fallback: shouldn't happen if cache is valid, but use a sensible default
+        ExtractionType::RawFile {
+            filename: self.ba.tool_name.clone(),
+        }
     }
 
-    /// Get the path to the metadata file
-    fn get_cache_metadata_path(&self, cache_key: &str) -> PathBuf {
-        self.get_cached_tarball_path(cache_key)
-            .join("metadata.json")
-    }
+    // -------------------------------------------------------------------------
+    // Extraction
+    // -------------------------------------------------------------------------
 
-    /// Check if a tarball is already cached
-    fn is_tarball_cached(&self, cache_key: &str) -> bool {
-        let extracted_path = self.get_cached_extracted_path(cache_key);
-        let metadata_path = self.get_cache_metadata_path(cache_key);
-        extracted_path.exists() && metadata_path.exists()
-    }
-
-    /// Extract tarball to cache directory
+    /// Extract artifact to cache with atomic rename
     fn extract_to_cache(
         &self,
         file_path: &Path,
         cache_key: &str,
         url: &str,
-        tv: &ToolVersion,
         opts: &ToolVersionOptions,
         pr: Option<&dyn SingleReport>,
-    ) -> Result<()> {
-        let cache_path = self.get_cached_tarball_path(cache_key);
-        let extracted_path = self.get_cached_extracted_path(cache_key);
-        let metadata_path = self.get_cache_metadata_path(cache_key);
+    ) -> Result<ExtractionType> {
+        let cache_path = self.cache_path(cache_key);
 
-        // Ensure parent directory exists (we'll atomically rename into it)
-        if let Some(parent) = cache_path.parent() {
-            file::create_dir_all(parent)?;
+        // Ensure parent directory exists
+        file::create_dir_all(Self::tarballs_dir())?;
+
+        // Create unique temp directory for atomic extraction
+        let tmp_path = Self::tarballs_dir().join(format!(
+            "{}.tmp-{}-{}",
+            cache_key,
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
+        ));
+
+        // Clean up any stale temp directory
+        if tmp_path.exists() {
+            let _ = file::remove_all(&tmp_path);
         }
 
-        // Create a unique temporary directory for atomic extraction
-        let pid = std::process::id();
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-        let tmp_dir_name = format!("{}.tmp-{}-{}", cache_key, pid, now_ms);
-        let tmp_extract_path = match cache_path.parent() {
-            Some(parent) => parent.join(tmp_dir_name),
-            None => cache_path.with_extension(format!("tmp-{}-{}", pid, now_ms)),
+        // Perform extraction
+        let extraction_type = self.extract_artifact(&tmp_path, file_path, opts, pr)?;
+
+        // Atomic replace
+        if cache_path.exists() {
+            file::remove_all(&cache_path)?;
+        }
+        std::fs::rename(&tmp_path, &cache_path)?;
+
+        // Write metadata
+        self.write_metadata(cache_key, url, file_path, opts)?;
+
+        Ok(extraction_type)
+    }
+
+    /// Extract a single artifact to the given directory
+    fn extract_artifact(
+        &self,
+        dest: &Path,
+        file_path: &Path,
+        opts: &ToolVersionOptions,
+        pr: Option<&dyn SingleReport>,
+    ) -> Result<ExtractionType> {
+        file::create_dir_all(dest)?;
+
+        let file_info = FileInfo::new(file_path, opts);
+
+        if file_info.is_compressed_binary {
+            self.extract_compressed_binary(dest, file_path, &file_info, opts, pr)
+        } else if file_info.format == file::TarFormat::Raw {
+            self.extract_raw_file(dest, file_path, &file_info, opts, pr)
+        } else {
+            self.extract_archive(dest, file_path, &file_info, opts, pr)
+        }
+    }
+
+    /// Extract a compressed binary (gz, xz, bz2, zst)
+    fn extract_compressed_binary(
+        &self,
+        dest: &Path,
+        file_path: &Path,
+        file_info: &FileInfo,
+        opts: &ToolVersionOptions,
+        pr: Option<&dyn SingleReport>,
+    ) -> Result<ExtractionType> {
+        let filename = self.dest_filename(file_path, file_info, opts);
+        let dest_file = dest.join(&filename);
+
+        // Report extraction progress
+        if let Some(pr) = pr {
+            pr.set_message(format!("extract {}", file_info.file_name()));
+            if let Ok(metadata) = file_path.metadata() {
+                pr.set_length(metadata.len());
+            }
+        }
+
+        match file_info.extension.as_str() {
+            "gz" => file::un_gz(file_path, &dest_file)?,
+            "xz" => file::un_xz(file_path, &dest_file)?,
+            "bz2" => file::un_bz2(file_path, &dest_file)?,
+            "zst" => file::un_zst(file_path, &dest_file)?,
+            _ => unreachable!(),
+        }
+
+        // Mark extraction complete
+        if let Some(pr) = pr
+            && let Ok(metadata) = file_path.metadata()
+        {
+            pr.set_position(metadata.len());
+        }
+
+        file::make_executable(&dest_file)?;
+        Ok(ExtractionType::RawFile { filename })
+    }
+
+    /// Extract a raw (uncompressed) file
+    fn extract_raw_file(
+        &self,
+        dest: &Path,
+        file_path: &Path,
+        file_info: &FileInfo,
+        opts: &ToolVersionOptions,
+        pr: Option<&dyn SingleReport>,
+    ) -> Result<ExtractionType> {
+        let filename = self.dest_filename(file_path, file_info, opts);
+        let dest_file = dest.join(&filename);
+
+        // Report extraction progress
+        if let Some(pr) = pr {
+            pr.set_message(format!("extract {}", file_info.file_name()));
+            if let Ok(metadata) = file_path.metadata() {
+                pr.set_length(metadata.len());
+            }
+        }
+
+        file::copy(file_path, &dest_file)?;
+
+        // Mark extraction complete
+        if let Some(pr) = pr
+            && let Ok(metadata) = file_path.metadata()
+        {
+            pr.set_position(metadata.len());
+        }
+
+        file::make_executable(&dest_file)?;
+        Ok(ExtractionType::RawFile { filename })
+    }
+
+    /// Extract an archive (tar, zip, etc.)
+    fn extract_archive(
+        &self,
+        dest: &Path,
+        file_path: &Path,
+        file_info: &FileInfo,
+        opts: &ToolVersionOptions,
+        pr: Option<&dyn SingleReport>,
+    ) -> Result<ExtractionType> {
+        let mut strip_components: Option<usize> =
+            get_opt(opts, "strip_components").and_then(|s| s.parse().ok());
+
+        // Auto-detect strip_components=1 for single-directory archives
+        if strip_components.is_none()
+            && get_opt(opts, "bin_path").is_none()
+            && file::should_strip_components(file_path, file_info.format).unwrap_or(false)
+        {
+            debug!("Auto-detected single directory archive, using strip_components=1");
+            strip_components = Some(1);
+        }
+
+        let tar_opts = file::TarOptions {
+            format: file_info.format,
+            strip_components: strip_components.unwrap_or(0),
+            pr,
+            preserve_mtime: false,
         };
 
-        // Ensure any previous temp dir is removed
-        if tmp_extract_path.exists() {
-            let _ = file::remove_all(&tmp_extract_path);
-        }
+        file::untar(file_path, dest, &tar_opts)?;
+        Ok(ExtractionType::Archive)
+    }
 
-        // Perform extraction into the temp directory
-        self.extract_artifact_to_cache(file_path, &tmp_extract_path, tv, opts, pr)?;
-
-        // Replace any existing extracted cache atomically
-        if extracted_path.exists() {
-            file::remove_all(&extracted_path)?;
-        }
-        // Rename temp directory to the final cache path
-        std::fs::rename(&tmp_extract_path, &extracted_path)?;
-
-        // Only write metadata after the extracted directory is in place
+    /// Write cache metadata file
+    fn write_metadata(
+        &self,
+        cache_key: &str,
+        url: &str,
+        file_path: &Path,
+        opts: &ToolVersionOptions,
+    ) -> Result<()> {
         let metadata = CacheMetadata {
             url: url.to_string(),
-            checksum: lookup_platform_key(opts, "checksum")
-                .or_else(|| opts.get("checksum").cloned()),
+            checksum: get_opt(opts, "checksum"),
             size: file_path.metadata()?.len(),
             extracted_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
             platform: self.get_platform_key(),
         };
 
-        let metadata_json = serde_json::to_string_pretty(&metadata)?;
-        file::write(&metadata_path, metadata_json)?;
-
+        let json = serde_json::to_string_pretty(&metadata)?;
+        file::write(self.metadata_path(cache_key), json)?;
         Ok(())
     }
 
-    /// Extract artifact to cache directory (similar to install_artifact but for cache)
-    fn extract_artifact_to_cache(
-        &self,
-        file_path: &Path,
-        cache_path: &Path,
-        tv: &ToolVersion,
-        opts: &ToolVersionOptions,
-        pr: Option<&dyn SingleReport>,
-    ) -> Result<()> {
-        let mut strip_components = opts.get("strip_components").and_then(|s| s.parse().ok());
+    // -------------------------------------------------------------------------
+    // Symlink creation
+    // -------------------------------------------------------------------------
 
-        file::create_dir_all(cache_path)?;
-
-        // Use TarFormat for format detection
-        let ext = file_path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        let format = file::TarFormat::from_ext(ext);
-
-        // Get file extension and detect format
-        let file_name = file_path.file_name().unwrap().to_string_lossy();
-
-        // Check if it's a compressed binary (not a tar archive)
-        let is_compressed_binary =
-            !file_name.contains(".tar") && matches!(ext, "gz" | "xz" | "bz2" | "zst");
-
-        if is_compressed_binary {
-            // Handle compressed single binary
-            let decompressed_name = file_name.trim_end_matches(&format!(".{}", ext));
-
-            // Determine the destination path
-            let (dest_dir, dest_filename) = if let Some(bin_path_template) = opts.get("bin_path") {
-                // If bin_path is specified, use it as directory
-                let bin_path = template_string(bin_path_template, tv);
-                let bin_dir = cache_path.join(&bin_path);
-                (bin_dir, std::ffi::OsString::from(decompressed_name))
-            } else if let Some(bin_name) = opts.get("bin") {
-                // If bin is specified, rename the file to this name
-                (cache_path.to_path_buf(), std::ffi::OsString::from(bin_name))
-            } else {
-                // Always auto-clean binary names by removing OS/arch suffixes
-                let cleaned_name = clean_binary_name(decompressed_name, Some(&self.ba.tool_name));
-                (
-                    cache_path.to_path_buf(),
-                    std::ffi::OsString::from(cleaned_name),
-                )
-            };
-
-            // Create the destination directory
-            file::create_dir_all(&dest_dir)?;
-
-            // Construct full destination path
-            let dest = dest_dir.join(&dest_filename);
-
-            match ext {
-                "gz" => file::un_gz(file_path, &dest)?,
-                "xz" => file::un_xz(file_path, &dest)?,
-                "bz2" => file::un_bz2(file_path, &dest)?,
-                "zst" => file::un_zst(file_path, &dest)?,
-                _ => unreachable!(),
-            }
-
-            file::make_executable(&dest)?;
-        } else if format == file::TarFormat::Raw {
-            // For raw files, determine the destination
-            let (dest_dir, dest_filename) = if let Some(bin_path_template) = opts.get("bin_path") {
-                // If bin_path is specified, use it as directory
-                let bin_path = template_string(bin_path_template, tv);
-                let bin_dir = cache_path.join(&bin_path);
-                (bin_dir, file_path.file_name().unwrap().to_os_string())
-            } else if let Some(bin_name) = opts.get("bin") {
-                // If bin is specified, rename the file to this name
-                (cache_path.to_path_buf(), std::ffi::OsString::from(bin_name))
-            } else {
-                // Always auto-clean binary names by removing OS/arch suffixes
-                let original_name = file_path.file_name().unwrap().to_string_lossy();
-                let cleaned_name = clean_binary_name(&original_name, Some(&self.ba.tool_name));
-                (
-                    cache_path.to_path_buf(),
-                    std::ffi::OsString::from(cleaned_name),
-                )
-            };
-
-            // Create the destination directory
-            file::create_dir_all(&dest_dir)?;
-
-            // Construct full destination path
-            let dest = dest_dir.join(&dest_filename);
-
-            file::copy(file_path, &dest)?;
-            file::make_executable(&dest)?;
-        } else {
-            // Auto-detect if we need strip_components=1 before extracting
-            // Only auto-strip if strip_components is not set AND bin_path is not explicitly configured
-            if strip_components.is_none() && opts.get("bin_path").is_none() {
-                if let Ok(should_strip) = file::should_strip_components(file_path, format) {
-                    if should_strip {
-                        debug!(
-                            "Auto-detected single directory archive, extracting with strip_components=1"
-                        );
-                        strip_components = Some(1);
-                    }
-                }
-            }
-
-            let tar_opts = file::TarOptions {
-                format,
-                strip_components: strip_components.unwrap_or(0),
-                pr,
-                preserve_mtime: false, // Bump mtime when extracting to cache
-            };
-
-            // Extract with determined strip_components
-            file::untar(file_path, cache_path, &tar_opts)?;
-        }
-
-        Ok(())
-    }
-
-    /// Create symlink from install directory to cache
+    /// Create install symlink(s) from install directory to cache
     fn create_install_symlink(
         &self,
         tv: &ToolVersion,
-        cache_path: &Path,
         cache_key: &str,
+        extraction_type: &ExtractionType,
+        opts: &ToolVersionOptions,
     ) -> Result<()> {
-        // Determine the appropriate version name for the symlink
+        let cache_path = self.cache_path(cache_key);
+
+        // Determine version name for install path
         let version_name = if tv.version == "latest" || tv.version.is_empty() {
-            // Use content-based versioning for implicit versions
-            &cache_key[..7.min(cache_key.len())]
+            &cache_key[..7.min(cache_key.len())] // Content-based versioning
         } else {
-            // Use the original version name for explicit versions
             &tv.version
         };
 
-        let version_install_path = tv.ba().installs_path.join(version_name);
+        let install_path = tv.ba().installs_path.join(version_name);
 
-        // Remove existing install path if it exists
-        if version_install_path.exists() {
-            file::remove_all(&version_install_path)?;
+        // Clean up existing install
+        if install_path.exists() {
+            file::remove_all(&install_path)?;
         }
-
-        // Create parent directory for symlink
-        if let Some(parent) = version_install_path.parent() {
+        if let Some(parent) = install_path.parent() {
             file::create_dir_all(parent)?;
         }
 
-        // Create symlink
-        file::make_symlink(cache_path, &version_install_path)?;
+        // Handle raw files with bin_path specially for deduplication
+        if let ExtractionType::RawFile { filename } = extraction_type
+            && let Some(bin_path_template) = get_opt(opts, "bin_path")
+        {
+            let bin_path = template_string(&bin_path_template, tv);
+            let dest_dir = install_path.join(&bin_path);
+            file::create_dir_all(&dest_dir)?;
 
+            let cached_file = cache_path.join(filename);
+            let install_file = dest_dir.join(filename);
+            file::make_symlink(&cached_file, &install_file)?;
+            return Ok(());
+        }
+
+        // Default: symlink entire install path to cache
+        file::make_symlink(&cache_path, &install_path)?;
         Ok(())
     }
 
-    /// Verify checksum if specified (moved from trait implementation)
+    /// Create additional symlink for implicit versions (latest, empty)
+    fn create_version_alias_symlink(&self, tv: &ToolVersion, cache_key: &str) -> Result<()> {
+        if tv.version != "latest" && !tv.version.is_empty() {
+            return Ok(());
+        }
+
+        let content_version = &cache_key[..7.min(cache_key.len())];
+        let original_path = tv.ba().installs_path.join(&tv.version);
+        let content_path = tv.ba().installs_path.join(content_version);
+
+        if original_path.exists() {
+            file::remove_all(&original_path)?;
+        }
+        if let Some(parent) = original_path.parent() {
+            file::create_dir_all(parent)?;
+        }
+
+        file::make_symlink(&content_path, &original_path)?;
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Checksum verification
+    // -------------------------------------------------------------------------
+
+    /// Verify or generate checksum for lockfile support
     fn verify_checksum(
         &self,
         ctx: &InstallContext,
@@ -301,47 +504,71 @@ impl HttpBackend {
         file_path: &Path,
     ) -> Result<()> {
         let settings = Settings::get();
-        let filename = file_path.file_name().unwrap().to_string_lossy().to_string();
+        let filename = file_path.file_name().unwrap().to_string_lossy();
         let lockfile_enabled = settings.lockfile && settings.experimental;
 
-        // Get the platform key for this tool and platform
         let platform_key = self.get_platform_key();
+        let platform_info = tv.lock_platforms.entry(platform_key).or_default();
 
-        // Get or create asset info for this platform
-        let platform_info = tv.lock_platforms.entry(platform_key.clone()).or_default();
-
+        // Verify or generate checksum
         if let Some(checksum) = &platform_info.checksum {
             ctx.pr.set_message(format!("checksum {filename}"));
-            if let Some((algo, check)) = checksum.split_once(':') {
-                hash::ensure_checksum(file_path, check, Some(ctx.pr.as_ref()), algo)?;
-            } else {
-                return Err(eyre::eyre!("Invalid checksum: {checksum}"));
-            }
+            let (algo, check) = checksum
+                .split_once(':')
+                .ok_or_else(|| eyre::eyre!("Invalid checksum format: {checksum}"))?;
+            hash::ensure_checksum(file_path, check, Some(ctx.pr.as_ref()), algo)?;
         } else if lockfile_enabled {
             ctx.pr.set_message(format!("generate checksum {filename}"));
-            let hash = hash::file_hash_blake3(file_path, Some(ctx.pr.as_ref()))?;
-            platform_info.checksum = Some(format!("blake3:{hash}"));
+            let h = hash::file_hash_blake3(file_path, Some(ctx.pr.as_ref()))?;
+            platform_info.checksum = Some(format!("blake3:{h}"));
         }
 
-        // Handle size verification and generation
+        // Verify or record size
         if let Some(expected_size) = platform_info.size {
             ctx.pr.set_message(format!("verify size {filename}"));
             let actual_size = file_path.metadata()?.len();
             if actual_size != expected_size {
                 return Err(eyre::eyre!(
-                    "Size mismatch for {}: expected {}, got {}",
-                    filename,
-                    expected_size,
-                    actual_size
+                    "Size mismatch for {filename}: expected {expected_size}, got {actual_size}"
                 ));
             }
         } else if lockfile_enabled {
-            ctx.pr.set_message(format!("record size {filename}"));
-            let size = file_path.metadata()?.len();
-            platform_info.size = Some(size);
+            platform_info.size = Some(file_path.metadata()?.len());
         }
+
         Ok(())
     }
+
+    // -------------------------------------------------------------------------
+    // Version listing
+    // -------------------------------------------------------------------------
+
+    /// Fetch versions from version_list_url if configured
+    async fn fetch_versions(&self) -> Result<Vec<String>> {
+        let opts = self.ba.opts();
+
+        let url = match opts.get("version_list_url") {
+            Some(url) => url.clone(),
+            None => return Ok(vec![]),
+        };
+
+        let regex = opts.get("version_regex").map(|s| s.as_str());
+        let json_path = opts.get("version_json_path").map(|s| s.as_str());
+
+        version_list::fetch_versions(&url, regex, json_path).await
+    }
+}
+
+/// Returns install-time-only option keys for HTTP backend.
+pub fn install_time_option_keys() -> Vec<String> {
+    vec![
+        "url".into(),
+        "checksum".into(),
+        "version_list_url".into(),
+        "version_regex".into(),
+        "version_json_path".into(),
+        "format".into(),
+    ]
 }
 
 #[async_trait]
@@ -354,9 +581,15 @@ impl Backend for HttpBackend {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
-        // Http backend doesn't support remote version listing
-        Ok(vec![])
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
+        let versions = self.fetch_versions().await?;
+        Ok(versions
+            .into_iter()
+            .map(|v| VersionInfo {
+                version: v,
+                ..Default::default()
+            })
+            .collect())
     }
 
     async fn install_version_(
@@ -366,90 +599,89 @@ impl Backend for HttpBackend {
     ) -> Result<ToolVersion> {
         let opts = tv.request.options();
 
-        // Use the new helper to get platform-specific URL first, then fall back to general URL
-        let url_template = lookup_platform_key(&opts, "url")
-            .or_else(|| opts.get("url").cloned())
-            .ok_or_else(|| {
-                let platform_key = self.get_platform_key();
-                let available = list_available_platforms_with_key(&opts, "url");
-                if !available.is_empty() {
-                    let list = available.join(", ");
-                    eyre::eyre!(
-                        "No URL configured for platform {platform_key}. Available platforms: {list}. Provide 'url' or add 'platforms.{platform_key}.url'"
-                    )
-                } else {
-                    eyre::eyre!("Http backend requires 'url' option")
-                }
-            })?;
+        // Get URL template
+        let url_template = get_opt(&opts, "url").ok_or_else(|| {
+            let platform_key = self.get_platform_key();
+            let available = list_available_platforms_with_key(&opts, "url");
+            if !available.is_empty() {
+                eyre::eyre!(
+                    "No URL for platform {platform_key}. Available: {}. \
+                     Provide 'url' or add 'platforms.{platform_key}.url'",
+                    available.join(", ")
+                )
+            } else {
+                eyre::eyre!("Http backend requires 'url' option")
+            }
+        })?;
 
-        // Template the URL with actual values
         let url = template_string(&url_template, &tv);
 
         // Download
         let filename = get_filename_from_url(&url);
         let file_path = tv.download_path().join(&filename);
 
-        // Store the asset URL in the tool version
+        // Record URL in lock platforms
         let platform_key = self.get_platform_key();
-        let platform_info = tv.lock_platforms.entry(platform_key).or_default();
-        platform_info.url = Some(url.clone());
+        tv.lock_platforms
+            .entry(platform_key.clone())
+            .or_default()
+            .url = Some(url.clone());
+
+        // Determine operation count for progress reporting
+        let mut op_count = 1; // download
+        if get_opt(&opts, "checksum").is_some() {
+            op_count += 1;
+        }
+        op_count += 1; // extraction
+
+        // Account for lockfile checksum verification/generation
+        let settings = Settings::get();
+        let lockfile_enabled = settings.lockfile && settings.experimental;
+        let has_lockfile_checksum = tv
+            .lock_platforms
+            .get(&platform_key)
+            .and_then(|p| p.checksum.as_ref())
+            .is_some();
+        if lockfile_enabled || has_lockfile_checksum {
+            op_count += 1;
+        }
+
+        ctx.pr.start_operations(op_count);
 
         ctx.pr.set_message(format!("download {filename}"));
         HTTP.download_file(&url, &file_path, Some(ctx.pr.as_ref()))
             .await?;
 
-        // Verify (shared)
+        // Verify artifact
         verify_artifact(&tv, &file_path, &opts, Some(ctx.pr.as_ref()))?;
 
-        // Generate cache key - always use Blake3 hash of the file for consistency
-        // This ensures that the same file content always gets the same cache key
-        // regardless of whether a checksum was provided or what algorithm was used
-        let cache_key = self.get_file_based_cache_key(&file_path, &opts)?;
-        let cached_extracted_path = self.get_cached_extracted_path(&cache_key);
+        // Generate cache key
+        let cache_key = self.cache_key(&file_path, &opts)?;
+        let file_info = FileInfo::new(&file_path, &opts);
 
-        // Acquire a cache-level lock to serialize extraction for this cache key
-        let _cache_lock = crate::lock_file::get(&cached_extracted_path, ctx.force)?;
+        // Acquire lock and extract or reuse cache
+        let cache_path = self.cache_path(&cache_key);
+        let _lock = crate::lock_file::get(&cache_path, ctx.force)?;
 
-        // Check if tarball is already cached
-        if self.is_tarball_cached(&cache_key) {
+        // Determine extraction type based on whether we're using cache or extracting fresh
+        // On cache hit, we need to detect the actual filename from the cache (which may differ
+        // from current options if a previous extraction used different `bin` name)
+        let extraction_type = if self.is_cached(&cache_key) {
             ctx.pr.set_message("using cached tarball".into());
+            // Report extraction operation as complete (instant since we're using cache)
+            ctx.pr.set_length(1);
+            ctx.pr.set_position(1);
+            self.extraction_type_from_cache(&cache_key, &file_info)
         } else {
             ctx.pr.set_message("extracting to cache".into());
-            self.extract_to_cache(
-                &file_path,
-                &cache_key,
-                &url,
-                &tv,
-                &opts,
-                Some(ctx.pr.as_ref()),
-            )?;
-        }
+            self.extract_to_cache(&file_path, &cache_key, &url, &opts, Some(ctx.pr.as_ref()))?
+        };
 
-        // Create symlink from install directory to cache
-        let content_version = &cache_key[..7.min(cache_key.len())]; // First 7 chars like git
-        self.create_install_symlink(&tv, &cached_extracted_path, &cache_key)?;
+        // Create symlinks
+        self.create_install_symlink(&tv, &cache_key, &extraction_type, &opts)?;
+        self.create_version_alias_symlink(&tv, &cache_key)?;
 
-        // For implicit versions, also create a symlink with the original version name
-        // pointing to our content-based version to maintain compatibility
-        if tv.version == "latest" || tv.version.is_empty() {
-            let original_install_path = tv.ba().installs_path.join(&tv.version);
-            let content_install_path = tv.ba().installs_path.join(content_version);
-
-            // Remove any existing directory at the original path
-            if original_install_path.exists() {
-                file::remove_all(&original_install_path)?;
-            }
-
-            // Create parent directory if needed
-            if let Some(parent) = original_install_path.parent() {
-                file::create_dir_all(parent)?;
-            }
-
-            // Create symlink from original version to content-based version
-            file::make_symlink(&content_install_path, &original_install_path)?;
-        }
-
-        // Verify checksum if specified
+        // Verify checksum for lockfile
         self.verify_checksum(ctx, &mut tv, &file_path)?;
 
         Ok(tv)
@@ -459,37 +691,39 @@ impl Backend for HttpBackend {
         &self,
         _config: &Arc<Config>,
         tv: &ToolVersion,
-    ) -> Result<Vec<std::path::PathBuf>> {
+    ) -> Result<Vec<PathBuf>> {
         let opts = tv.request.options();
-        if let Some(bin_path_template) = opts.get("bin_path") {
-            let bin_path = template_string(bin_path_template, tv);
-            Ok(vec![tv.install_path().join(bin_path)])
-        } else {
-            // Look for bin directory in the install path
-            let bin_path = tv.install_path().join("bin");
-            if bin_path.exists() {
-                Ok(vec![bin_path])
-            } else {
-                // Look for bin directory in subdirectories (for extracted archives)
-                let mut paths = Vec::new();
-                if let Ok(entries) = std::fs::read_dir(tv.install_path()) {
-                    for entry in entries.flatten() {
-                        let entry_path = entry.path();
-                        // Only check directories, not files
-                        if entry_path.is_dir() {
-                            let sub_bin_path = entry_path.join("bin");
-                            if sub_bin_path.exists() {
-                                paths.push(sub_bin_path);
-                            }
-                        }
+
+        // Check for explicit bin_path
+        if let Some(bin_path_template) = get_opt(&opts, "bin_path") {
+            let bin_path = template_string(&bin_path_template, tv);
+            return Ok(vec![tv.install_path().join(bin_path)]);
+        }
+
+        // Check for bin directory
+        let bin_dir = tv.install_path().join("bin");
+        if bin_dir.exists() {
+            return Ok(vec![bin_dir]);
+        }
+
+        // Search subdirectories for bin directories
+        let mut paths = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(tv.install_path()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let sub_bin = path.join("bin");
+                    if sub_bin.exists() {
+                        paths.push(sub_bin);
                     }
                 }
-                if !paths.is_empty() {
-                    Ok(paths)
-                } else {
-                    Ok(vec![tv.install_path()])
-                }
             }
+        }
+
+        if paths.is_empty() {
+            Ok(vec![tv.install_path()])
+        } else {
+            Ok(paths)
         }
     }
 }

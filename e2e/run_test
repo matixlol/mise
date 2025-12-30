@@ -56,9 +56,17 @@ remove_isolated_env() {
 }
 
 within_isolated_env() {
-	_env \
-		--ignore-environment \
-		--chdir="$TEST_WORKDIR" \
+	local proxy_vars=()
+	[[ -n ${http_proxy:-} ]] && proxy_vars+=(http_proxy="$http_proxy")
+	[[ -n ${https_proxy:-} ]] && proxy_vars+=(https_proxy="$https_proxy")
+	[[ -n ${HTTP_PROXY:-} ]] && proxy_vars+=(HTTP_PROXY="$HTTP_PROXY")
+	[[ -n ${HTTPS_PROXY:-} ]] && proxy_vars+=(HTTPS_PROXY="$HTTPS_PROXY")
+	[[ -n ${no_proxy:-} ]] && proxy_vars+=(no_proxy="$no_proxy")
+	[[ -n ${NO_PROXY:-} ]] && proxy_vars+=(NO_PROXY="$NO_PROXY")
+
+	env \
+		-i \
+		-C "$TEST_WORKDIR" \
 		- \
 		CARGO_HOME="$CARGO_HOME" \
 		CARGO_LLVM_COV="${CARGO_LLVM_COV:-}" \
@@ -70,6 +78,7 @@ within_isolated_env() {
 		HOME="$TEST_HOME" \
 		LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
 		LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE:-}" \
+		${proxy_vars[@]+"${proxy_vars[@]}"} \
 		MISE_CACHE_DIR="$MISE_CACHE_DIR" \
 		MISE_CACHE_PRUNE_AGE="0" \
 		MISE_CONFIG_DIR="$MISE_CONFIG_DIR" \
@@ -85,6 +94,7 @@ within_isolated_env() {
 		MISE_TRACE="${MISE_TRACE:-0}" \
 		MISE_TRUSTED_CONFIG_PATHS="$TEST_ISOLATED_DIR" \
 		MISE_USE_VERSIONS_HOST="${MISE_USE_VERSIONS_HOST:-1}" \
+		MISE_USE_VERSIONS_HOST_TRACK=0 \
 		MISE_YES=1 \
 		PATH="${CARGO_TARGET_DIR:-$ROOT/target}/debug:$HOME/mise/bin:$CARGO_HOME/bin:$TEST_HOME/bin:$HOME/.local/bin:/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin" \
 		ROOT="$ROOT" \
@@ -101,13 +111,28 @@ within_isolated_env() {
 }
 
 run_test() {
+	# Check for problematic /tmp/mise.toml that can interfere with tests
+	if [[ -f /tmp/mise.toml ]]; then
+		err "/tmp/mise.toml exists and will interfere with e2e tests. Please remove it."
+		return 1
+	fi
+
 	setup_isolated_env
 	create_isolated_env
 
 	local status=0
 
 	START="$(date +%s)"
-	within_isolated_env bash --noprofile --norc -euo pipefail -c "source \"$SCRIPT_DIR/assert.sh\" && source \"$TEST_SCRIPT\"" || status=$?
+	# Check shebang to determine which shell to use
+	local shebang
+	shebang="$(head -n 1 "$TEST_SCRIPT")"
+	if [[ $shebang == "#!/usr/bin/env zsh"* ]]; then
+		within_isolated_env zsh -f -euo pipefail -c "source \"$SCRIPT_DIR/assert.sh\" && source \"$TEST_SCRIPT\"" || status=$?
+	elif [[ $shebang == "#!/usr/bin/env fish"* ]]; then
+		within_isolated_env fish --no-config "$TEST_SCRIPT" || status=$?
+	else
+		within_isolated_env bash --noprofile --norc -euo pipefail -c "source \"$SCRIPT_DIR/assert.sh\" && source \"$TEST_SCRIPT\"" || status=$?
+	fi
 	END="$(date +%s)"
 	DURATION=$((END - START))s
 
@@ -132,14 +157,6 @@ run_test() {
 	fi
 
 	return "$status"
-}
-
-_env() {
-	if type genv >/dev/null 2>&1; then
-		genv "$@"
-	else
-		env "$@"
-	fi
 }
 
 os() {
